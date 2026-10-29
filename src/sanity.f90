@@ -69,8 +69,8 @@ module mod_sanity
       if(myid == 0)  print*, 'ERROR: `is_ibm = T` with implicit diffusion requires `is_impdiff_1d = T` &
                              &(the 3D FFT-based Helmholtz solver cannot hold the IB term).'; call abortit
     end if
-    if(.not.any(trim(ibm_shape) == ['macdonald','sinusoid '])) then
-      if(myid == 0)  print*, 'ERROR: `ibm_shape` must be either `macdonald` or `sinusoid`.'; call abortit
+    if(.not.any(trim(ibm_shape) == ['macdonald','sinusoid ','cones    '])) then
+      if(myid == 0)  print*, 'ERROR: `ibm_shape` must be `macdonald`, `sinusoid` or `cones`.'; call abortit
     end if
     if(is_ibm .and. .not.use_hmap .and. trim(ibm_shape) == 'macdonald') then
       block

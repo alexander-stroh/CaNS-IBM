@@ -91,6 +91,26 @@ module mod_ibm
                        real(n_wave(side,i)*x1/l(i),rp)+phase_l(side,i)))+&
                        amp_l(side,ii)*0.5_rp*(1._rp+sin(2._rp*pi*&
                        real(n_wave(side,ii)*x2/l(ii),rp)+phase_l(side,ii)))
+            case('cones')
+                !
+                ! staggered truncated cones (Theobald et al., WCCM-ECCOMAS 2020): height amp_l(side,i),
+                ! base radius 1.25*height, flank slope 55 degrees; n_wave(side,i) x n_wave(side,ii) units
+                ! of two cones each, centred at (1/4,1/4) and (3/4,3/4) of the unit
+                !
+                block
+                  real(rp) :: lu1,lu2,d1,d2,r,rb,rt
+                  lu1 = l(i )/n_wave(side,i )
+                  lu2 = l(ii)/n_wave(side,ii)
+                  d1 = x1-0.25_rp*lu1; d1 = d1-lu1*nint(d1/lu1)
+                  d2 = x2-0.25_rp*lu2; d2 = d2-lu2*nint(d2/lu2)
+                  r  = sqrt(d1**2+d2**2)
+                  d1 = x1-0.75_rp*lu1; d1 = d1-lu1*nint(d1/lu1)
+                  d2 = x2-0.75_rp*lu2; d2 = d2-lu2*nint(d2/lu2)
+                  r  = min(r,sqrt(d1**2+d2**2))
+                  rb = 1.25_rp*amp_l(side,i)
+                  rt = rb-amp_l(side,i)/tan(55._rp*pi/180._rp)
+                  height = amp_l(side,i)*min(1._rp,max(0._rp,(rb-r)/(rb-rt)))
+                end block
             case default ! 'macdonald'
                 if(side == 0)then
                     height=amp_l(side,i)*(1._rp + &
@@ -290,7 +310,7 @@ module mod_ibm
                     if(laplacian_id(i,j,k) /= 0._rp) then
                         ib = ib+1
                         idx(:,ib) = [i,j,k]
-                        lap_b(ib) = laplacian_id(i,j,k)
+                        lap_b(ib) = laplacian_id(i,j,k)*ibm_lap_fac
                     end if
                 end do
             end do

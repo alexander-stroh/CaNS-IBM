@@ -130,6 +130,7 @@ character(len=16), protected :: ibm_shape = 'macdonald' ! analytic wall shape: '
 real(rp), protected   :: ibm_hch = -1._rp ! reference half height for the rough-wall grid (gtype = 5)
 character(len=16), protected :: bulk_vel_def = 'superficial' ! IBM bulk velocity: 'superficial' or 'intrinsic'
 character(len=16), protected :: ibm_proj = 'none' ! IB-aware velocity correction: 'none' or 'damped'
+real(rp), protected   :: ibm_lap_fac = 1._rp ! TEST ONLY (cones-test): factor on the IB laplacian (0: staircase only)
 integer , protected   :: ibm_iout_wall = -1 ! interval of the per-point wall outputs (< 0: iout1d)
 !hmap
 logical,protected     :: use_hmap=.false.
@@ -207,7 +208,8 @@ contains
                             ibm_hch,          &
                             bulk_vel_def,     &
                             ibm_proj,         &
-                            ibm_iout_wall
+                            ibm_iout_wall,    &
+                            ibm_lap_fac
     namelist /hmap/ &
                             use_hmap,         &
                             hmap_mode,        &        
