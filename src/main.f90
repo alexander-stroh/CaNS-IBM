@@ -44,6 +44,7 @@ program cans
   use mod_load           , only: load_one
   use mod_mom            , only: bulk_forcing
   use mod_rk             , only: rk,rk_scal,calc_a_b
+  use mod_updiss         , only: updiss_init
   use mod_timer          , only: timer_tic,timer_toc
   use mod_output         , only: out0d,gen_alias,out1d,out1d_chan,out1d_chan_ibm,out2d,out3d, &
                                  write_log_output,write_visu_2d,write_visu_3d
@@ -81,7 +82,7 @@ program cans
                                  amp_l,            &
                                  phase_l,          &
                                  bulk_vel_def,     &
-                                 ibm_proj,ibm_iout_wall, &
+                                 ibm_proj,ibm_iout_wall,ibm_updiss, &
                                  ibm_hch,          &
                                  use_hmap,         &
                                  override_grid,     &
@@ -592,6 +593,7 @@ program cans
 #endif
     allocate(imp_map(n(1),n(2),2))
     !$acc enter data create(imp_map)
+    if(ibm_updiss > 0._rp) call updiss_init(n,l,zc,zf,dzc,hmax_g,ibm_direction(:,3),cbcpre,bcpre,nb,is_bound,dl)
   endif
   if(is_ibm)then
     print*, "***IBM coefficients are deploying***"

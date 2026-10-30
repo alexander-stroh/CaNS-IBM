@@ -17,10 +17,11 @@ module mod_rk
                        momx_d_xy,momy_d_xy,momz_d_xy, &
                        momx_d_z ,momy_d_z ,momz_d_z, &
                        mom_xyz_ad
-  use mod_param, only: test_hypx,is_impdiff,is_impdiff_1d,is_boussinesq_buoyancy,is_fast_mom_kernels,is_ibm,const_scal, &
+  use mod_param, only: ibm_updiss,is_impdiff,is_impdiff_1d,is_boussinesq_buoyancy,is_fast_mom_kernels,is_ibm,const_scal, &
                        adv_form,bulk_vel_def
   use mod_scal , only: scal,cmpt_scalflux,scalar
   use mod_utils, only: bulk_mean,bulk_mean_ibm
+  use mod_updiss, only: mom_updiss
   use mod_types
   implicit none
   public rk,rk_scal
@@ -171,7 +172,7 @@ module mod_rk
         call momz_a_vv(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,u,v,w,dwdtrk)
       end if
     end if
-    if(test_hypx > 0._rp) call mom_hypx(n(1),n(2),n(3),dli(1),test_hypx,u,v,w,dudtrk,dvdtrk,dwdtrk)
+    if(ibm_updiss > 0._rp) call mom_updiss(n,dli,u,v,w,mask_u,mask_v,mask_w,dudtrk,dvdtrk,dwdtrk)
     !
 #if !defined(_LOOP_UNSWITCHING)
     !$acc parallel loop collapse(3) default(present) async(1)
@@ -762,36 +763,6 @@ module mod_rk
   end subroutine cmpt_bulk_forcing_alternative
 
 !********//IBM\\*********!
-  subroutine mom_hypx(nx,ny,nz,dxi,c,u,v,w,dudt,dvdt,dwdt)
-    !
-    ! TEST ONLY (cones-test): dissipative part of third-order upwind advection in x,
-    ! -c*|u|*dx**3/12*d4q/dx4, for q = u, v, w; x must be local and periodic (x pencils)
-    !
-    implicit none
-    integer , intent(in) :: nx,ny,nz
-    real(rp), intent(in) :: dxi,c
-    real(rp), intent(in   ), dimension(0:,0:,0:) :: u,v,w
-    real(rp), intent(inout), dimension(:,:,:)    :: dudt,dvdt,dwdt
-    integer  :: i,j,k,im2,im1,ip1,ip2
-    real(rp) :: fac
-    fac = c*dxi/12._rp
-    !$acc parallel loop collapse(3) default(present) private(im2,im1,ip1,ip2) async(1)
-    !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared)  PRIVATE(im2,im1,ip1,ip2)
-    do k=1,nz
-      do j=1,ny
-        do i=1,nx
-          im2 = modulo(i-3,nx)+1; im1 = modulo(i-2,nx)+1
-          ip1 = modulo(i  ,nx)+1; ip2 = modulo(i+1,nx)+1
-          dudt(i,j,k) = dudt(i,j,k) - fac*abs(u(i,j,k))* &
-                        (u(ip2,j,k)-4._rp*u(ip1,j,k)+6._rp*u(i,j,k)-4._rp*u(im1,j,k)+u(im2,j,k))
-          dvdt(i,j,k) = dvdt(i,j,k) - fac*abs(0.25_rp*(u(i,j,k)+u(i,j+1,k)+u(im1,j,k)+u(im1,j+1,k)))* &
-                        (v(ip2,j,k)-4._rp*v(ip1,j,k)+6._rp*v(i,j,k)-4._rp*v(im1,j,k)+v(im2,j,k))
-          dwdt(i,j,k) = dwdt(i,j,k) - fac*abs(0.25_rp*(u(i,j,k)+u(i,j,k+1)+u(im1,j,k)+u(im1,j,k+1)))* &
-                        (w(ip2,j,k)-4._rp*w(ip1,j,k)+6._rp*w(i,j,k)-4._rp*w(im1,j,k)+w(im2,j,k))
-        end do
-      end do
-    end do
-  end subroutine mom_hypx
   subroutine calc_a_b(idx,lap_b,A_id,B_id,dt_loop,visc)
     implicit none
     integer ,intent(in),dimension(:,:)          :: idx   ! band points (`set_ibm_band`)

@@ -310,7 +310,7 @@ module mod_ibm
                     if(laplacian_id(i,j,k) /= 0._rp) then
                         ib = ib+1
                         idx(:,ib) = [i,j,k]
-                        lap_b(ib) = laplacian_id(i,j,k)*ibm_lap_fac
+                        lap_b(ib) = laplacian_id(i,j,k)
                     end if
                 end do
             end do
