@@ -14,10 +14,14 @@ module mod_updiss
   ! develops upstream of a sharp immersed body. The band weights phi_x, phi_y in [0,1] are
   !  - 'slab': a function of z only, 1 up to ibm_updiss_band*hmax from a rough z-wall,
   !            then a cosine taper to 0 over a further hmax (phi_x = phi_y);
-  !  - 'body': a function of the distance d to the body along the x (phi_x) or y (phi_y)
-  !            grid line through the point, 1 up to d = ibm_updiss_ncell cells, then a cosine
-  !            taper to 0 over a further ibm_updiss_ntaper cells; the wall is located with
-  !            `isInbody`, as for the IB coefficients, and the solid points have phi = 1
+  !  - 'body': a function of the distance r to the body, in units of dx (phi_x) or dy (phi_y):
+  !            1 up to r = ibm_updiss_ncell, then a cosine taper to 0 over a further
+  !            ibm_updiss_ntaper; r = min over the grid planes z' of
+  !            sqrt(((z-z')/dx)**2 + (d(z')/dx)**2), with d(z') the distance to the body along
+  !            the x grid line at z' (0 in the body), so the band also covers the flow over the
+  !            body; the wall is located with `isInbody`, as for the IB coefficients. Planes at
+  !            or beyond the floor of a rough z-wall (hmin) are skipped, so the flat floor
+  !            between roughness elements is not part of the body
   !
   use mpi
   use mod_bound   , only: boundp
@@ -40,7 +44,7 @@ module mod_updiss
   real(rp), allocatable, dimension(:,:,:,:,:) :: phi       ! (0:n1+1,0:n2+1,0:n3+1,x/y,c)
   real(rp), allocatable, dimension(:,:,:)     :: gx,gy
   contains
-  subroutine updiss_init(n,lo,l,dl,zc,zf,dzc,hmax,cbcpre,bcpre,nb,is_bound)
+  subroutine updiss_init(n,lo,l,dl,zc_g,zf_g,dzc,hmin,hmax,cbcpre,bcpre,nb,is_bound)
     !
     ! band weights at the u, v and w points (halos included, so that no exchange is needed);
     ! the halos of the second differences use the pressure boundary conditions
@@ -48,15 +52,19 @@ module mod_updiss
     implicit none
     integer , intent(in), dimension(3)     :: n,lo
     real(rp), intent(in), dimension(3)     :: l,dl
-    real(rp), intent(in), dimension(0:)    :: zc,zf,dzc
-    real(rp), intent(in)                   :: hmax
+    real(rp), intent(in), dimension(0:)    :: zc_g,zf_g ! global
+    real(rp), intent(in), dimension(0:)    :: dzc
+    real(rp), intent(in)                   :: hmin,hmax
     character(len=1), intent(in), dimension(0:1,3) :: cbcpre
     real(rp), intent(in), dimension(0:1,3) :: bcpre
     integer , intent(in), dimension(0:1,3) :: nb
     logical , intent(in), dimension(0:1,3) :: is_bound
     real(rp), parameter :: pi = acos(-1._rp)
-    real(rp) :: xyz(3),d,frac(5)
-    integer  :: i,j,k,c,a
+    real(rp), allocatable, dimension(:)     :: zg
+    real(rp), allocatable, dimension(:,:,:) :: d2
+    logical , allocatable, dimension(:)     :: need
+    real(rp) :: xyz(3),d,rw,frac(5)
+    integer  :: i,j,k,c,a,kg,ng3
     !
     cbc_g(:,:) = cbcpre(:,:); bc_g(:,:) = bcpre(:,:); nb_g(:,:) = nb(:,:)
     is_bound_g(:,:) = is_bound(:,:); dl_g(:) = dl(:)
@@ -64,32 +72,58 @@ module mod_updiss
     allocate(phi(0:n(1)+1,0:n(2)+1,0:n(3)+1,2,3))
     dzc_g(:) = dzc(0:n(3)+1)
     phi(:,:,:,:,:) = 0._rp
+    ng3 = ubound(zc_g,1)-1
+    allocate(zg(0:ng3+1),need(0:ng3+1))
+    if(trim(ibm_updiss_mode) == 'body') allocate(d2(0:n(1)+1,0:n(2)+1,0:ng3+1))
     do c=1,3
-      do k=0,n(3)+1
-        do j=0,n(2)+1
-          do i=0,n(1)+1
-            xyz(1) = (lo(1)+i-1-0.5_rp+merge(0.5_rp,0._rp,c == 1))*dl(1)
-            xyz(2) = (lo(2)+j-1-0.5_rp+merge(0.5_rp,0._rp,c == 2))*dl(2)
-            xyz(3) = merge(zf(k),zc(k),c == 3)
-            select case(trim(ibm_updiss_mode))
-            case('slab')
-              d = huge(1._rp)
-              if(ibm_direction(0,3)) d = min(d,xyz(3))
-              if(ibm_direction(1,3)) d = min(d,l(3)-xyz(3))
-              phi(i,j,k,:,c) = taper(d,ibm_updiss_band*hmax,hmax)
-            case('body')
-              if(near_body(xyz(3))) then
+      zg(:) = merge(zf_g(0:ng3+1),zc_g(0:ng3+1),c == 3)
+      select case(trim(ibm_updiss_mode))
+      case('slab')
+        do k=0,n(3)+1
+          d = huge(1._rp)
+          if(ibm_direction(0,3)) d = min(d,zg(lo(3)-1+k))
+          if(ibm_direction(1,3)) d = min(d,l(3)-zg(lo(3)-1+k))
+          phi(:,:,k,:,c) = taper(d,ibm_updiss_band*hmax,hmax)
+        end do
+      case('body')
+        do a=1,2
+          !
+          ! line distances (in cells) in the planes within reach of the local points
+          !
+          rw = (ibm_updiss_ncell+ibm_updiss_ntaper)*dl(a)
+          do kg=0,ng3+1
+            need(kg) = valid(zg(kg)) .and. &
+                       minval(abs(zg(lo(3)-1:lo(3)+n(3))-zg(kg))) < rw
+          end do
+          do kg=0,ng3+1
+            if(.not.need(kg)) cycle
+            do j=0,n(2)+1
+              do i=0,n(1)+1
+                xyz(:) = [coord(i,1,c),coord(j,2,c),zg(kg)]
                 if(inbody(xyz)) then
-                  phi(i,j,k,:,c) = 1._rp
+                  d2(i,j,kg) = 0._rp
                 else
-                  do a=1,2
-                    phi(i,j,k,a,c) = taper(line_dist(xyz,a)/dl(a),ibm_updiss_ncell,ibm_updiss_ntaper)
-                  end do
+                  d2(i,j,kg) = line_dist(xyz,a)/dl(a)
                 end if
-              end if
-            end select
+              end do
+            end do
+          end do
+          do k=0,n(3)+1
+            do kg=0,ng3+1
+              if(.not.need(kg)) cycle
+              d = ((zg(lo(3)-1+k)-zg(kg))/dl(a))**2
+              if(d >= (rw/dl(a))**2) cycle
+              do j=0,n(2)+1
+                do i=0,n(1)+1
+                  phi(i,j,k,a,c) = max(phi(i,j,k,a,c), &
+                                       taper(sqrt(d+d2(i,j,kg)**2),ibm_updiss_ncell,ibm_updiss_ntaper))
+                end do
+              end do
+            end do
           end do
         end do
+      end select
+      do k=0,n(3)+1
         kact(k,c) = any(phi(:,:,k,:,c) > 0._rp)
       end do
     end do
@@ -101,7 +135,8 @@ module mod_updiss
     frac(3:4) = [sum(phi(1:n(1),1:n(2),1:n(3),1,1)),sum(phi(1:n(1),1:n(2),1:n(3),2,1))]
     frac(5)   = product(1._rp*n(:))
     call MPI_ALLREDUCE(MPI_IN_PLACE,frac,5,MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
-    if(myid == 0) print*,'upwind dissipation (',trim(ibm_updiss_mode),'): volume share, mean weight (x, y) = ',frac(1:4)/frac(5)
+    if(myid == 0) print*,'upwind dissipation (',trim(ibm_updiss_mode),'): share of grid points, mean weight (x, y) = ', &
+                         frac(1:4)/frac(5)
     allocate(gx(0:n(1)+1,0:n(2)+1,0:n(3)+1),gy(0:n(1)+1,0:n(2)+1,0:n(3)+1))
     gx(:,:,:) = 0._rp; gy(:,:,:) = 0._rp
     !$acc enter data copyin(kact,phi,gx,gy,dzc_g)
@@ -118,14 +153,24 @@ module mod_updiss
         taper = 0.5_rp*(1._rp+cos(pi*(d-h)/w))
       end if
     end function taper
-    logical function near_body(z)
+    logical function valid(z)
       !
-      ! the x and y grid lines at height z can meet the body (z-walls only: within hmax)
+      ! the x and y grid lines at height z can meet the body (z-walls: within hmax of the
+      ! wall) and z is above the floor (hmin) of the rough z-walls
       !
       real(rp), intent(in) :: z
-      near_body = any(ibm_direction(:,1:2)) .or. &
-                  (ibm_direction(0,3) .and. z <= hmax) .or. (ibm_direction(1,3) .and. z >= l(3)-hmax)
-    end function near_body
+      valid = any(ibm_direction(:,1:2)) .or. &
+              (ibm_direction(0,3) .and. z <= hmax) .or. (ibm_direction(1,3) .and. z >= l(3)-hmax)
+      if(ibm_direction(0,3)) valid = valid .and. z > hmin
+      if(ibm_direction(1,3)) valid = valid .and. z < l(3)-hmin
+    end function valid
+    real(rp) function coord(i,a,c)
+      !
+      ! coordinate along x (a = 1) or y (a = 2) of local point i of component c
+      !
+      integer, intent(in) :: i,a,c
+      coord = (lo(a)+i-1-0.5_rp+merge(0.5_rp,0._rp,c == a))*dl(a)
+    end function coord
     logical function inbody(p)
       real(rp), intent(in) :: p(3)
       inbody = isInbody(ibm_direction,amp_l,n_wave,l_0,phase_l,p(1),p(2),p(3),n,l, &
@@ -134,14 +179,14 @@ module mod_updiss
     real(rp) function line_dist(p,a)
       !
       ! distance from the fluid point p to the body along direction a (both senses), found by
-      ! stepping one cell at a time and bisecting the first fluid/solid interval; huge if the
-      ! body is farther than the band
+      ! stepping one cell at a time and bisecting the first fluid/solid interval; 1e10 cells
+      ! if the body is farther than the band
       !
       real(rp), intent(in) :: p(3)
       integer , intent(in) :: a
       integer  :: s,m,it
       real(rp) :: q(3),df,ds,dm
-      line_dist = huge(1._rp)
+      line_dist = 1.e10_rp*dl(a)
       do s=-1,1,2
         q(:) = p(:)
         do m=1,ceiling(ibm_updiss_ncell+ibm_updiss_ntaper)+1
