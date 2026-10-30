@@ -392,6 +392,11 @@ ibm_hch      = -1.
 bulk_vel_def = 'superficial'
 ibm_proj     = 'none'
 ibm_iout_wall = -1
+ibm_updiss_mode = 'none'
+ibm_updiss   = 1.
+ibm_updiss_band = 2.
+ibm_updiss_ncell = 4.
+ibm_updiss_ntaper = 2.
 /
 ```
 `ibm_shape` selects the analytic wall shape (with `&hmap use_hmap = F`). For a wall normal to direction `t` on side `s` (`ibm_direction(s,t) = T`), with in-plane directions `i = mod(t,3)+1` and `ii = mod(t+1,3)+1`, and the bottom wall at `l_0(0,t) + h`, the top wall at `l_0(1,t) - h`:
@@ -409,6 +414,11 @@ The roughness height range printed at start-up (`hmin`, `hmax`) is sampled from 
 * `'damped'`: the correction is divided by the IB coefficient `A` at the non-solid points, as the exact IB scheme integrates a pressure-gradient impulse, and the solid points are not corrected, so their velocity stays exactly zero. The velocity is then divergence free only up to a residual in the cut cells, of the same size as the divergence that `'none'` creates when it zeroes the solid points, so the divergence check does not abort on it. The fluid bulk velocity is no longer conserved by the correction; with bulk forcing it is restored at the next stage. The cost is that of `'none'`.
 
 In tests (turbulent channel over the MacDonald wall, 64^3) the two options give the same errors and temporal order (2 at the band points) to three digits; `'damped'` removes only the solid leakage. A lagged pre-compensation of the predictor with the previous pressure correction (Kim-Moin type) was tested and is unstable: the zeroing of the solid points at each stage start already acts as such a pre-compensation.
+
+`ibm_updiss_mode` adds, near the immersed body, the dissipative part of third-order upwind advection in x and y, `-d/dx(c phi_x |u| dx^3/12 d^3q/dx^3) - d/dy(c phi_y |v| dy^3/12 d^3q/dy^3)` for each velocity component `q`, in flux form (momentum conservative). The central advection is non-dissipative, and at cell Peclet numbers well above 2 the sharp IB makes it develop grid-scale (2 dx) wiggles upstream of the body, visible in the mean wall-normal velocity and in `u'w'`; the term damps them. `c = ibm_updiss`; for `c > 1.087` the advective time step is reduced by `1.087/c` (RK3 stability). The band weights `phi_x`, `phi_y` in [0,1] are:
+* `'none'` (default): no term, no cost.
+* `'slab'`: a function of z only, 1 up to `ibm_updiss_band*hmax` from a rough z-wall, then a cosine taper to 0 over a further `hmax`.
+* `'body'`: a function of the distance to the body along the x grid line (`phi_x`) or the y grid line (`phi_y`) through the point: 1 up to `ibm_updiss_ncell` cells, then a cosine taper to 0 over a further `ibm_updiss_ntaper` cells (solid points: 1). The wall is located with the same geometry routine as the IB coefficients. The term then acts only upstream, downstream and beside the body, not over the flat floor between roughness elements, and its extent shrinks with the grid.
 
 `ibm_iout_wall` is the interval, in time steps, of the per-point wall outputs `fric-*`, `pressure*`, `FV-fric_*` and `ibm_wall_stress_*` below. A negative value (default) uses `iout1d`; `0` switches them off. The plane statistics `turb_stats_*` stay at `iout1d`. On fine grids the per-cell files are large (one line per cut cell), so a larger interval than `iout1d` keeps the statistics frequent without them.
 

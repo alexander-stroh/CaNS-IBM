@@ -17,7 +17,7 @@ module mod_rk
                        momx_d_xy,momy_d_xy,momz_d_xy, &
                        momx_d_z ,momy_d_z ,momz_d_z, &
                        mom_xyz_ad
-  use mod_param, only: ibm_updiss,is_impdiff,is_impdiff_1d,is_boussinesq_buoyancy,is_fast_mom_kernels,is_ibm,const_scal, &
+  use mod_param, only: ibm_updiss_mode,is_impdiff,is_impdiff_1d,is_boussinesq_buoyancy,is_fast_mom_kernels,is_ibm,const_scal, &
                        adv_form,bulk_vel_def
   use mod_scal , only: scal,cmpt_scalflux,scalar
   use mod_utils, only: bulk_mean,bulk_mean_ibm
@@ -172,7 +172,7 @@ module mod_rk
         call momz_a_vv(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,u,v,w,dwdtrk)
       end if
     end if
-    if(ibm_updiss > 0._rp) call mom_updiss(n,dli,u,v,w,mask_u,mask_v,mask_w,dudtrk,dvdtrk,dwdtrk)
+    if(trim(ibm_updiss_mode) /= 'none') call mom_updiss(n,dli,u,v,w,mask_u,mask_v,mask_w,dudtrk,dvdtrk,dwdtrk)
     !
 #if !defined(_LOOP_UNSWITCHING)
     !$acc parallel loop collapse(3) default(present) async(1)

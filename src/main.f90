@@ -82,7 +82,7 @@ program cans
                                  amp_l,            &
                                  phase_l,          &
                                  bulk_vel_def,     &
-                                 ibm_proj,ibm_iout_wall,ibm_updiss, &
+                                 ibm_proj,ibm_iout_wall,ibm_updiss_mode, &
                                  ibm_hch,          &
                                  use_hmap,         &
                                  override_grid,     &
@@ -593,7 +593,7 @@ program cans
 #endif
     allocate(imp_map(n(1),n(2),2))
     !$acc enter data create(imp_map)
-    if(ibm_updiss > 0._rp) call updiss_init(n,l,zc,zf,dzc,hmax_g,ibm_direction(:,3),cbcpre,bcpre,nb,is_bound,dl)
+    if(trim(ibm_updiss_mode) /= 'none') call updiss_init(n,lo,l,dl,zc,zf,dzc,hmax_g,cbcpre,bcpre,nb,is_bound)
   endif
   if(is_ibm)then
     print*, "***IBM coefficients are deploying***"

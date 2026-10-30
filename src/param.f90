@@ -130,8 +130,11 @@ character(len=16), protected :: ibm_shape = 'macdonald' ! analytic wall shape: '
 real(rp), protected   :: ibm_hch = -1._rp ! reference half height for the rough-wall grid (gtype = 5)
 character(len=16), protected :: bulk_vel_def = 'superficial' ! IBM bulk velocity: 'superficial' or 'intrinsic'
 character(len=16), protected :: ibm_proj = 'none' ! IB-aware velocity correction: 'none' or 'damped'
-real(rp), protected   :: ibm_updiss = 0._rp ! c of the upwind dissipation in x and y above the rough z-walls (0: off)
-real(rp), protected   :: ibm_updiss_band = 2._rp ! its band height in units of hmax (cosine taper over a further hmax)
+character(len=16), protected :: ibm_updiss_mode = 'none' ! upwind dissipation in x and y near the body: 'none', 'slab' or 'body'
+real(rp), protected   :: ibm_updiss = 1._rp ! its coefficient c
+real(rp), protected   :: ibm_updiss_band = 2._rp ! 'slab': band height in units of hmax (cosine taper over a further hmax)
+real(rp), protected   :: ibm_updiss_ncell = 4._rp ! 'body': band width in cells along the x/y grid lines ...
+real(rp), protected   :: ibm_updiss_ntaper = 2._rp ! ... and the width of its cosine taper in cells
 integer , protected   :: ibm_iout_wall = -1 ! interval of the per-point wall outputs (< 0: iout1d)
 !hmap
 logical,protected     :: use_hmap=.false.
@@ -210,8 +213,11 @@ contains
                             bulk_vel_def,     &
                             ibm_proj,         &
                             ibm_iout_wall,    &
+                            ibm_updiss_mode,  &
                             ibm_updiss,       &
-                            ibm_updiss_band
+                            ibm_updiss_band,  &
+                            ibm_updiss_ncell, &
+                            ibm_updiss_ntaper
     namelist /hmap/ &
                             use_hmap,         &
                             hmap_mode,        &        
