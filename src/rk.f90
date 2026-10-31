@@ -172,7 +172,7 @@ module mod_rk
         call momz_a_vv(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,u,v,w,dwdtrk)
       end if
     end if
-    if(trim(ibm_updiss_mode) /= 'none') call mom_updiss(n,dli,u,v,w,mask_u,mask_v,mask_w,dudtrk,dvdtrk,dwdtrk)
+    if(trim(ibm_updiss_mode) /= 'none') call mom_updiss(n,dli,u,v,w,dudtrk,dvdtrk,dwdtrk)
     !
 #if !defined(_LOOP_UNSWITCHING)
     !$acc parallel loop collapse(3) default(present) async(1)

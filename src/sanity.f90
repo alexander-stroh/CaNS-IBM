@@ -102,9 +102,10 @@ module mod_sanity
       if(myid == 0)  print*, 'ERROR: `ibm_updiss_mode` must be `none`, `slab` or `body`.'; call abortit
     end if
     if(trim(ibm_updiss_mode) /= 'none') then
-      if(ibm_updiss <= 0._rp .or. ibm_updiss_band <= 0._rp .or. ibm_updiss_ncell < 0._rp .or. ibm_updiss_ntaper <= 0._rp) then
-        if(myid == 0)  print*, 'ERROR: `ibm_updiss`, `ibm_updiss_band` and `ibm_updiss_ntaper` must be > 0, &
-                                       &`ibm_updiss_ncell` >= 0.'; call abortit
+      if(ibm_updiss <= 0._rp .or. ibm_updiss_band <= 0._rp .or. ibm_updiss_ncell < 0 .or. ibm_updiss_ntaper < 0 .or. &
+         ibm_updiss_ncell+ibm_updiss_ntaper < 1) then
+        if(myid == 0)  print*, 'ERROR: `ibm_updiss` and `ibm_updiss_band` must be > 0, `ibm_updiss_ncell` and &
+                                       &`ibm_updiss_ntaper` >= 0, with a sum >= 1.'; call abortit
       end if
       if(.not.is_ibm) then
         if(myid == 0)  print*, 'ERROR: `ibm_updiss_mode /= ''none''` requires `is_ibm = T`.'; call abortit

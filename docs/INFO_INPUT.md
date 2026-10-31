@@ -395,8 +395,8 @@ ibm_iout_wall = -1
 ibm_updiss_mode = 'none'
 ibm_updiss   = 1.
 ibm_updiss_band = 2.
-ibm_updiss_ncell = 4.
-ibm_updiss_ntaper = 2.
+ibm_updiss_ncell = 2
+ibm_updiss_ntaper = 0
 /
 ```
 `ibm_shape` selects the analytic wall shape (with `&hmap use_hmap = F`). For a wall normal to direction `t` on side `s` (`ibm_direction(s,t) = T`), with in-plane directions `i = mod(t,3)+1` and `ii = mod(t+1,3)+1`, and the bottom wall at `l_0(0,t) + h`, the top wall at `l_0(1,t) - h`:
@@ -415,10 +415,11 @@ The roughness height range printed at start-up (`hmin`, `hmax`) is sampled from 
 
 In tests (turbulent channel over the MacDonald wall, 64^3) the two options give the same errors and temporal order (2 at the band points) to three digits; `'damped'` removes only the solid leakage. A lagged pre-compensation of the predictor with the previous pressure correction (Kim-Moin type) was tested and is unstable: the zeroing of the solid points at each stage start already acts as such a pre-compensation.
 
-`ibm_updiss_mode` adds, near the immersed body, the dissipative part of third-order upwind advection in x and y, `-d/dx(c phi_x |u| dx^3/12 d^3q/dx^3) - d/dy(c phi_y |v| dy^3/12 d^3q/dy^3)` for each velocity component `q`, in flux form (momentum conservative). The central advection is non-dissipative, and at cell Peclet numbers well above 2 the sharp IB makes it develop grid-scale (2 dx) wiggles upstream of the body, visible in the mean wall-normal velocity and in `u'w'`; the term damps them. `c = ibm_updiss`; for `c > 1.087` the advective time step is reduced by `1.087/c` (RK3 stability). The band weights `phi_x`, `phi_y` in [0,1] are:
-* `'none'` (default): no term, no cost.
-* `'slab'`: a function of z only, 1 up to `ibm_updiss_band*hmax` from a rough z-wall, then a cosine taper to 0 over a further `hmax`.
-* `'body'`: a function of the distance `r` to the body in units of `dx` (`phi_x`) or `dy` (`phi_y`): 1 up to `r = ibm_updiss_ncell`, then a cosine taper to 0 over a further `ibm_updiss_ntaper` (solid points: 1). `r` is the minimum over the grid planes `z'` of `sqrt(((z-z')/dx)^2 + (d(z')/dx)^2)`, where `d(z')` is the distance to the body along the x (or y) grid line at height `z'`, located with the same geometry routine as the IB coefficients. The band thus covers the flow upstream, downstream, beside and above the body (the wiggles are carried above the crest by the upwash), but not the flat floor between roughness elements: planes at or below the floor height `hmin` of a rough z-wall are skipped. Its extent shrinks with the grid.
+`ibm_updiss_mode` adds, near the immersed body, the dissipative part of third-order upwind advection, `-d/dx(c phi |u| dx^3/12 d^3q/dx^3) - d/dy(c phi |v| dy^3/12 d^3q/dy^3) - d/dz(c phi |w| dz^3/12 d^3q/dz^3)` for each velocity component `q`, in flux form (momentum conservative; in z with undivided differences on the stretched grid). The central advection is non-dissipative, and at cell Peclet numbers well above 2 the sharp IB makes it develop grid-scale (2 dx) wiggles upstream of the body, visible in the mean wall-normal velocity and in `u'w'`; the term damps them. `c = ibm_updiss`; for `c > 1.087` the advective time step is reduced by `1.087/c` (RK3 stability). The weight `phi` in [0,1] is:
+
+* `'none'`: no term (default); nothing is allocated or computed.
+* `'slab'`: x and y terms only, `phi` a function of z only: 1 up to `ibm_updiss_band*hmax` from a rough z-wall, then a cosine taper to 0 over a further `hmax`. Requires rough z-walls.
+* `'body'`: a layer around the immersed wall, grown from the IB mask of each velocity component: level 1 are the fluid points with a solid neighbour (the points carrying IB coefficients), level `m` the fluid points next to level `m-1`, neighbours counted in all 26 directions so that the layer is isotropic in grid cells. `phi = 1` up to level `ibm_updiss_ncell`, then a cosine taper over a further `ibm_updiss_ntaper` levels (solid points: 1). The layer depends neither on the geometry nor on the wall orientation, and shrinks with the grid. The term is computed only on the layer points.
 
 `ibm_iout_wall` is the interval, in time steps, of the per-point wall outputs `fric-*`, `pressure*`, `FV-fric_*` and `ibm_wall_stress_*` below. A negative value (default) uses `iout1d`; `0` switches them off. The plane statistics `turb_stats_*` stay at `iout1d`. On fine grids the per-cell files are large (one line per cut cell), so a larger interval than `iout1d` keeps the statistics frequent without them.
 
