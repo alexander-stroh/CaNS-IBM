@@ -13,15 +13,12 @@ module mod_updiss
   ! written in flux form (momentum conservative, phi averaged to the flux faces); in z with
   ! undivided differences on the stretched grid. It damps the grid-scale (2*dx) wiggles that
   ! the non-dissipative central advection develops upstream of a sharp immersed body.
-  ! The weight phi in [0,1] is
-  !  - 'slab': a function of z only, 1 up to ibm_updiss_band*hmax from a rough z-wall,
-  !            then a cosine taper to 0 over a further hmax; x and y terms only;
-  !  - 'body': a layer around the immersed wall, grown from the IB mask of each velocity
-  !            component: level 1 are the fluid points with a solid neighbour (the points with
-  !            IB coefficients), level m the fluid points next to level m-1 (neighbours in all
-  !            26 directions, so that the layer is isotropic in grid cells). phi = 1 up to level
-  !            ibm_updiss_ncell, then a cosine taper over a further ibm_updiss_ntaper levels;
-  !            phi = 1 in the solid. Independent of the geometry and of the wall orientation
+  ! The weight phi in [0,1] ('body') is a layer around the immersed wall, grown from the IB
+  ! mask of each velocity component: level 1 are the fluid points with a solid neighbour (the
+  ! points with IB coefficients), level m the fluid points next to level m-1 (neighbours in
+  ! all 26 directions, so that the layer is isotropic in grid cells). phi = 1 up to level
+  ! ibm_updiss_ncell, then a cosine taper over a further ibm_updiss_ntaper levels; phi = 1 in
+  ! the solid. It is independent of the geometry and of the wall orientation
   !
   ! the term is evaluated only on compact lists of the points where it acts and, for the
   ! second differences, of their neighbours
@@ -29,8 +26,7 @@ module mod_updiss
   use mpi
   use mod_bound   , only: boundp
   use mod_common_mpi, only: myid,ierr
-  use mod_param   , only: ibm_updiss,ibm_updiss_mode,ibm_updiss_band,ibm_updiss_ncell,ibm_updiss_ntaper, &
-                          ibm_direction
+  use mod_param   , only: ibm_updiss,ibm_updiss_ncell,ibm_updiss_ntaper
   use mod_types
   implicit none
   private
@@ -40,25 +36,21 @@ module mod_updiss
   integer         , dimension(0:1,3) :: nb_g
   logical         , dimension(0:1,3) :: is_bound_g
   real(rp)        , dimension(3)     :: dl_g
-  logical :: is_z
   real(rp), allocatable, dimension(:)       :: dzc_g,dzci_g,dzfi_g
   real(rp), allocatable, dimension(:,:,:,:) :: phi       ! (0:n1+1,0:n2+1,0:n3+1,c)
   real(rp), allocatable, dimension(:,:,:)   :: gx,gy,gz
   integer , allocatable, dimension(:,:,:)   :: ipt,ipg   ! (3,np,c): points of the term, of the differences
   integer , dimension(3) :: npt,npg
   contains
-  subroutine updiss_init(n,lo,l,dl,zc_g,zf_g,dzc,dzf,hmin,hmax,mask_u,mask_v,mask_w, &
-                         cbcpre,bcpre,nb,is_bound)
+  subroutine updiss_init(n,dl,dzc,dzf,mask_u,mask_v,mask_w,cbcpre,bcpre,nb,is_bound)
     !
     ! weights at the u, v and w points (halos included) and the point lists;
     ! the halos of the second differences use the pressure boundary conditions
     !
     implicit none
-    integer , intent(in), dimension(3)     :: n,lo
-    real(rp), intent(in), dimension(3)     :: l,dl
-    real(rp), intent(in), dimension(0:)    :: zc_g,zf_g ! global
+    integer , intent(in), dimension(3)     :: n
+    real(rp), intent(in), dimension(3)     :: dl
     real(rp), intent(in), dimension(0:)    :: dzc,dzf
-    real(rp), intent(in)                   :: hmin,hmax
     logical , intent(in), dimension(0:,0:,0:) :: mask_u,mask_v,mask_w
     character(len=1), intent(in), dimension(0:1,3) :: cbcpre
     real(rp), intent(in), dimension(0:1,3) :: bcpre
@@ -67,74 +59,56 @@ module mod_updiss
     real(rp), parameter :: pi = acos(-1._rp)
     real(rp), allocatable, dimension(:,:,:,:) :: lev
     logical , allocatable, dimension(:,:,:,:) :: ist,isg
-    real(rp) :: d,frac(3)
+    real(rp) :: frac(3)
     integer  :: i,j,k,c,m,nl
     !
     cbc_g(:,:) = cbcpre(:,:); bc_g(:,:) = bcpre(:,:); nb_g(:,:) = nb(:,:)
     is_bound_g(:,:) = is_bound(:,:); dl_g(:) = dl(:)
-    is_z = trim(ibm_updiss_mode) == 'body'
     allocate(dzc_g(0:n(3)+1),dzci_g(0:n(3)+1),dzfi_g(0:n(3)+1))
     dzc_g(:) = dzc(0:n(3)+1); dzci_g(:) = 1._rp/dzc(0:n(3)+1); dzfi_g(:) = 1._rp/dzf(0:n(3)+1)
     allocate(phi(0:n(1)+1,0:n(2)+1,0:n(3)+1,3))
     phi(:,:,:,:) = 0._rp
-    select case(trim(ibm_updiss_mode))
-    case('slab')
-      do c=1,3
-        do k=0,n(3)+1
-          d = huge(1._rp)
-          if(ibm_direction(0,3)) d = min(d,     merge(zf_g(lo(3)-1+k),zc_g(lo(3)-1+k),c == 3))
-          if(ibm_direction(1,3)) d = min(d,l(3)-merge(zf_g(lo(3)-1+k),zc_g(lo(3)-1+k),c == 3))
-          phi(:,:,k,c) = taper(d,ibm_updiss_band*hmax,hmax)
-        end do
-      end do
-    case('body')
-      !
-      ! level of each point: 0 in the solid, m in the m-th fluid layer, nl+3 beyond;
-      ! levels nl+1 and nl+2 (phi = 0) are needed by the flux stencil
-      !
-      nl = ibm_updiss_ncell+ibm_updiss_ntaper
-      allocate(lev(0:n(1)+1,0:n(2)+1,0:n(3)+1,3))
-      lev(:,:,:,1) = merge(0._rp,nl+3._rp,mask_u(:,:,:))
-      lev(:,:,:,2) = merge(0._rp,nl+3._rp,mask_v(:,:,:))
-      lev(:,:,:,3) = merge(0._rp,nl+3._rp,mask_w(:,:,:))
-      do c=1,3
-        do m=1,nl+2
-          do k=1,n(3)
-            do j=1,n(2)
-              do i=1,n(1)
-                if(lev(i,j,k,c) > m .and. any(lev(i-1:i+1,j-1:j+1,k-1:k+1,c) == m-1)) lev(i,j,k,c) = m
-              end do
-            end do
-          end do
-          call halo(lev(:,:,:,c))
-        end do
-        do k=0,n(3)+1
-          do j=0,n(2)+1
-            do i=0,n(1)+1
-              m = nint(lev(i,j,k,c))
-              if(m <= ibm_updiss_ncell) then
-                phi(i,j,k,c) = 1._rp
-              else if(m <= nl) then
-                phi(i,j,k,c) = 0.5_rp*(1._rp+cos(pi*(m-ibm_updiss_ncell)/(ibm_updiss_ntaper+1._rp)))
-              end if
+    !
+    ! level of each point: 0 in the solid, m in the m-th fluid layer, nl+3 beyond;
+    ! levels nl+1 and nl+2 (phi = 0) are needed by the flux stencil
+    !
+    nl = ibm_updiss_ncell+ibm_updiss_ntaper
+    allocate(lev(0:n(1)+1,0:n(2)+1,0:n(3)+1,3))
+    lev(:,:,:,1) = merge(0._rp,nl+3._rp,mask_u(:,:,:))
+    lev(:,:,:,2) = merge(0._rp,nl+3._rp,mask_v(:,:,:))
+    lev(:,:,:,3) = merge(0._rp,nl+3._rp,mask_w(:,:,:))
+    do c=1,3
+      do m=1,nl+2
+        do k=1,n(3)
+          do j=1,n(2)
+            do i=1,n(1)
+              if(lev(i,j,k,c) > m .and. any(lev(i-1:i+1,j-1:j+1,k-1:k+1,c) == m-1)) lev(i,j,k,c) = m
             end do
           end do
         end do
+        call halo(lev(:,:,:,c))
       end do
-    end select
+      do k=0,n(3)+1
+        do j=0,n(2)+1
+          do i=0,n(1)+1
+            m = nint(lev(i,j,k,c))
+            if(m <= ibm_updiss_ncell) then
+              phi(i,j,k,c) = 1._rp
+            else if(m <= nl) then
+              phi(i,j,k,c) = 0.5_rp*(1._rp+cos(pi*(m-ibm_updiss_ncell)/(ibm_updiss_ntaper+1._rp)))
+            end if
+          end do
+        end do
+      end do
+    end do
     !
     ! point lists: the fluid points with a nonzero face weight (the term) and the points
     ! next to them (the second differences)
     !
     allocate(ist(n(1),n(2),n(3),3),isg(n(1),n(2),n(3),3))
-    if(is_z) then
-      isg(:,:,:,:) = lev(1:n(1),1:n(2),1:n(3),:) <= nl+2
-      ist(:,:,:,:) = lev(1:n(1),1:n(2),1:n(3),:) <= nl+1
-      deallocate(lev)
-    else
-      isg(:,:,:,:) = phi(1:n(1),1:n(2),1:n(3),:) > 0._rp
-      ist(:,:,:,:) = isg(:,:,:,:)
-    end if
+    isg(:,:,:,:) = lev(1:n(1),1:n(2),1:n(3),:) <= nl+2
+    ist(:,:,:,:) = lev(1:n(1),1:n(2),1:n(3),:) <= nl+1
+    deallocate(lev)
     ist(:,:,:,1) = ist(:,:,:,1) .and. .not.mask_u(1:n(1),1:n(2),1:n(3))
     ist(:,:,:,2) = ist(:,:,:,2) .and. .not.mask_v(1:n(1),1:n(2),1:n(3))
     ist(:,:,:,3) = ist(:,:,:,3) .and. .not.mask_w(1:n(1),1:n(2),1:n(3))
@@ -154,25 +128,13 @@ module mod_updiss
     frac(2) = sum(phi(1:n(1),1:n(2),1:n(3),1),mask=.not.mask_u(1:n(1),1:n(2),1:n(3)))
     frac(3) = product(1._rp*n(:))
     call MPI_ALLREDUCE(MPI_IN_PLACE,frac,3,MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
-    if(myid == 0) print*,'upwind dissipation (',trim(ibm_updiss_mode),'): share of grid points (u), mean weight there = ', &
+    if(myid == 0) print*,'upwind dissipation near the body: share of grid points (u), mean weight there = ', &
                          frac(1)/frac(3),frac(2)/max(frac(1),1._rp)
     deallocate(ist,isg)
     allocate(gx(0:n(1)+1,0:n(2)+1,0:n(3)+1),gy(0:n(1)+1,0:n(2)+1,0:n(3)+1),gz(0:n(1)+1,0:n(2)+1,0:n(3)+1))
     gx(:,:,:) = 0._rp; gy(:,:,:) = 0._rp; gz(:,:,:) = 0._rp
     !$acc enter data copyin(phi,ipt,ipg,gx,gy,gz,dzc_g,dzci_g,dzfi_g)
   contains
-    real(rp) function taper(d,h,w)
-      !
-      ! 1 for d <= h, cosine taper to 0 at d = h+w
-      !
-      real(rp), intent(in) :: d,h,w
-      taper = 0._rp
-      if(d <= h) then
-        taper = 1._rp
-      else if(d < h+w) then
-        taper = 0.5_rp*(1._rp+cos(pi*(d-h)/w))
-      end if
-    end function taper
     subroutine halo(p)
       !
       ! exchanges the halos of the levels; at the domain boundaries the halos keep the
@@ -217,12 +179,10 @@ module mod_updiss
     real(rp), intent(inout), dimension(:,:,:)    :: dudt,dvdt,dwdt
     real(rp) :: fx,fy,fz,uxp,uxm,vyp,vym,wzp,wzm,ph
     integer  :: i,j,k,ip,np
-    logical  :: lz
     !
     fx = 0.5_rp*ibm_updiss*dli(1)/12._rp ! 0.5: face average of phi
     fy = 0.5_rp*ibm_updiss*dli(2)/12._rp
     fz = 0.5_rp*ibm_updiss/12._rp        ! times 1/dz of the control volume
-    lz = is_z                            ! scalars in the device loops: local copies
     !
     ! u at (i+1/2,j,k): x fluxes at the cell centres, y fluxes at (i+1/2,j+1/2), z fluxes at (i+1/2,j,k+1/2)
     !
@@ -240,11 +200,9 @@ module mod_updiss
       dudt(i,j,k) = dudt(i,j,k) - ( &
                     fx*(uxp*(gx(i+1,j,k)-gx(i,j,k))-uxm*(gx(i,j,k)-gx(i-1,j,k))) + &
                     fy*(vyp*(gy(i,j+1,k)-gy(i,j,k))-vym*(gy(i,j,k)-gy(i,j-1,k))) )
-      if(lz) then
-        wzp = abs(0.5_rp*(w(i  ,j  ,k  )+w(i+1,j  ,k  )))*(ph+phi(i,j,k+1,1))
-        wzm = abs(0.5_rp*(w(i  ,j  ,k-1)+w(i+1,j  ,k-1)))*(ph+phi(i,j,k-1,1))
-        dudt(i,j,k) = dudt(i,j,k) - fz*dzfi_g(k)*(wzp*(gz(i,j,k+1)-gz(i,j,k))-wzm*(gz(i,j,k)-gz(i,j,k-1)))
-      end if
+      wzp = abs(0.5_rp*(w(i  ,j  ,k  )+w(i+1,j  ,k  )))*(ph+phi(i,j,k+1,1))
+      wzm = abs(0.5_rp*(w(i  ,j  ,k-1)+w(i+1,j  ,k-1)))*(ph+phi(i,j,k-1,1))
+      dudt(i,j,k) = dudt(i,j,k) - fz*dzfi_g(k)*(wzp*(gz(i,j,k+1)-gz(i,j,k))-wzm*(gz(i,j,k)-gz(i,j,k-1)))
     end do
     !
     ! v at (i,j+1/2,k): x fluxes at (i+1/2,j+1/2), y fluxes at the cell centres, z fluxes at (i,j+1/2,k+1/2)
@@ -263,11 +221,9 @@ module mod_updiss
       dvdt(i,j,k) = dvdt(i,j,k) - ( &
                     fx*(uxp*(gx(i+1,j,k)-gx(i,j,k))-uxm*(gx(i,j,k)-gx(i-1,j,k))) + &
                     fy*(vyp*(gy(i,j+1,k)-gy(i,j,k))-vym*(gy(i,j,k)-gy(i,j-1,k))) )
-      if(lz) then
-        wzp = abs(0.5_rp*(w(i  ,j  ,k  )+w(i  ,j+1,k  )))*(ph+phi(i,j,k+1,2))
-        wzm = abs(0.5_rp*(w(i  ,j  ,k-1)+w(i  ,j+1,k-1)))*(ph+phi(i,j,k-1,2))
-        dvdt(i,j,k) = dvdt(i,j,k) - fz*dzfi_g(k)*(wzp*(gz(i,j,k+1)-gz(i,j,k))-wzm*(gz(i,j,k)-gz(i,j,k-1)))
-      end if
+      wzp = abs(0.5_rp*(w(i  ,j  ,k  )+w(i  ,j+1,k  )))*(ph+phi(i,j,k+1,2))
+      wzm = abs(0.5_rp*(w(i  ,j  ,k-1)+w(i  ,j+1,k-1)))*(ph+phi(i,j,k-1,2))
+      dvdt(i,j,k) = dvdt(i,j,k) - fz*dzfi_g(k)*(wzp*(gz(i,j,k+1)-gz(i,j,k))-wzm*(gz(i,j,k)-gz(i,j,k-1)))
     end do
     !
     ! w at (i,j,k+1/2): x fluxes at (i+1/2,j,k+1/2), y fluxes at (i,j+1/2,k+1/2), z fluxes at the cell centres
@@ -286,11 +242,9 @@ module mod_updiss
       dwdt(i,j,k) = dwdt(i,j,k) - ( &
                     fx*(uxp*(gx(i+1,j,k)-gx(i,j,k))-uxm*(gx(i,j,k)-gx(i-1,j,k))) + &
                     fy*(vyp*(gy(i,j+1,k)-gy(i,j,k))-vym*(gy(i,j,k)-gy(i,j-1,k))) )
-      if(lz) then
-        wzp = abs(0.5_rp*(w(i  ,j  ,k  )+w(i  ,j  ,k+1)))*(ph+phi(i,j,k+1,3))
-        wzm = abs(0.5_rp*(w(i  ,j  ,k-1)+w(i  ,j  ,k  )))*(ph+phi(i,j,k-1,3))
-        dwdt(i,j,k) = dwdt(i,j,k) - fz*dzci_g(k)*(wzp*(gz(i,j,k+1)-gz(i,j,k))-wzm*(gz(i,j,k)-gz(i,j,k-1)))
-      end if
+      wzp = abs(0.5_rp*(w(i  ,j  ,k  )+w(i  ,j  ,k+1)))*(ph+phi(i,j,k+1,3))
+      wzm = abs(0.5_rp*(w(i  ,j  ,k-1)+w(i  ,j  ,k  )))*(ph+phi(i,j,k-1,3))
+      dwdt(i,j,k) = dwdt(i,j,k) - fz*dzci_g(k)*(wzp*(gz(i,j,k+1)-gz(i,j,k))-wzm*(gz(i,j,k)-gz(i,j,k-1)))
     end do
   end subroutine mom_updiss
   !
@@ -304,19 +258,18 @@ module mod_updiss
     integer , intent(in) :: c
     real(rp), intent(in), dimension(0:,0:,0:) :: q
     integer :: i,j,k,ip,np
-    logical :: lz
     !
-    np = npg(c); lz = is_z
+    np = npg(c)
     !$acc parallel loop gang vector default(present) private(i,j,k) async(1)
     !$OMP PARALLEL DO   DEFAULT(shared)  PRIVATE(i,j,k)
     do ip=1,np
       i = ipg(1,ip,c); j = ipg(2,ip,c); k = ipg(3,ip,c)
       gx(i,j,k) = q(i+1,j,k)-2._rp*q(i,j,k)+q(i-1,j,k)
       gy(i,j,k) = q(i,j+1,k)-2._rp*q(i,j,k)+q(i,j-1,k)
-      if(lz) gz(i,j,k) = q(i,j,k+1)-2._rp*q(i,j,k)+q(i,j,k-1)
+      gz(i,j,k) = q(i,j,k+1)-2._rp*q(i,j,k)+q(i,j,k-1)
     end do
     call boundp(cbc_g,n,bc_g,nb_g,is_bound_g,dl_g,dzc_g,gx)
     call boundp(cbc_g,n,bc_g,nb_g,is_bound_g,dl_g,dzc_g,gy)
-    if(is_z) call boundp(cbc_g,n,bc_g,nb_g,is_bound_g,dl_g,dzc_g,gz)
+    call boundp(cbc_g,n,bc_g,nb_g,is_bound_g,dl_g,dzc_g,gz)
   end subroutine diff2
 end module mod_updiss

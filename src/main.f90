@@ -593,8 +593,8 @@ program cans
 #endif
     allocate(imp_map(n(1),n(2),2))
     !$acc enter data create(imp_map)
-    if(trim(ibm_updiss_mode) /= 'none') call updiss_init(n,lo,l,dl,zc_g,zf_g,dzc,dzf,hmin_g,hmax_g, &
-                                                        mask_u,mask_v,mask_w,cbcpre,bcpre,nb,is_bound)
+    if(trim(ibm_updiss_mode) /= 'none') call updiss_init(n,dl,dzc,dzf,mask_u,mask_v,mask_w, &
+                                                        cbcpre,bcpre,nb,is_bound)
   endif
   if(is_ibm)then
     print*, "***IBM coefficients are deploying***"

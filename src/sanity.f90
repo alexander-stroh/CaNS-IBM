@@ -21,7 +21,7 @@ module mod_sanity
   use mod_param     , only: ipencil_axis,is_impdiff,is_impdiff_1d,is_poisson_pcr_tdma,small,adv_form, &
                             is_ibm,nscal,cbcscal_ibm,bulk_vel_def, &
                             ibm_shape,use_hmap,ibm_direction,amp_l,phase_l,ibm_proj, &
-                            ibm_updiss_mode,ibm_updiss,ibm_updiss_band,ibm_updiss_ncell,ibm_updiss_ntaper
+                            ibm_updiss_mode,ibm_updiss,ibm_updiss_ncell,ibm_updiss_ntaper
 #if !defined(_OPENACC)
   use mod_solver    , only: solver
 #else
@@ -98,20 +98,17 @@ module mod_sanity
     if(trim(ibm_proj) /= 'none' .and. .not.is_ibm) then
       if(myid == 0)  print*, 'ERROR: `ibm_proj /= ''none''` requires `is_ibm = T`.'; call abortit
     end if
-    if(.not.any(trim(ibm_updiss_mode) == ['none','slab','body'])) then
-      if(myid == 0)  print*, 'ERROR: `ibm_updiss_mode` must be `none`, `slab` or `body`.'; call abortit
+    if(.not.any(trim(ibm_updiss_mode) == ['none','body'])) then
+      if(myid == 0)  print*, 'ERROR: `ibm_updiss_mode` must be `none` or `body`.'; call abortit
     end if
     if(trim(ibm_updiss_mode) /= 'none') then
-      if(ibm_updiss <= 0._rp .or. ibm_updiss_band <= 0._rp .or. ibm_updiss_ncell < 0 .or. ibm_updiss_ntaper < 0 .or. &
+      if(ibm_updiss <= 0._rp .or. ibm_updiss_ncell < 0 .or. ibm_updiss_ntaper < 0 .or. &
          ibm_updiss_ncell+ibm_updiss_ntaper < 1) then
-        if(myid == 0)  print*, 'ERROR: `ibm_updiss` and `ibm_updiss_band` must be > 0, `ibm_updiss_ncell` and &
+        if(myid == 0)  print*, 'ERROR: `ibm_updiss` must be > 0, `ibm_updiss_ncell` and &
                                        &`ibm_updiss_ntaper` >= 0, with a sum >= 1.'; call abortit
       end if
       if(.not.is_ibm) then
         if(myid == 0)  print*, 'ERROR: `ibm_updiss_mode /= ''none''` requires `is_ibm = T`.'; call abortit
-      end if
-      if(trim(ibm_updiss_mode) == 'slab' .and. .not.any(ibm_direction(:,3))) then
-        if(myid == 0)  print*, 'ERROR: `ibm_updiss_mode = ''slab''` requires rough z-walls.'; call abortit
       end if
     end if
     if(is_ibm .and. nscal > 0) then
