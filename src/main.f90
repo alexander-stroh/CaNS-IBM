@@ -95,6 +95,8 @@ program cans
   use mod_cht            , only: cht_init
   use mod_ibm_sdf        , only: sdf_read,sdf_staggered,sdf_mask,set_ibm_2nd_sdf,calc_grad_dist_sdf, &
                                  set_cht_geometry_sdf
+  use mod_ibm_damp       , only: ibm_damp_init
+  use mod_param          , only: is_ibm_damp,ibm_damp_d
 #if !defined(_OPENACC)
   use mod_solver         , only: solver
 #else
@@ -329,6 +331,11 @@ program cans
   is_cht_any = .false.
   if(nscal > 0) is_cht_any = any(scalars(:)%is_cht)
   is_sdf = trim(geometry) == 'sdf'
+  if(is_ibm_damp .and. .not.(is_ibm .and. is_sdf)) then
+    if(myid == 0) print*, 'ERROR: is_ibm_damp needs the level-set geometry (is_ibm = T, geometry = ''sdf'').'
+    call MPI_FINALIZE(ierr)
+    error stop
+  end if
   !
   ! largest scalar diffusivity for the time step limit of explicit diffusion
   ! (inside the solid of CHT scalars: conductivity over heat capacity)
@@ -633,6 +640,7 @@ program cans
     call sdf_mask(phi_v_sdf,mask_v)
     call sdf_mask(phi_w_sdf,mask_w)
     call sdf_mask(phi_s_sdf,mask_s)
+    if(is_ibm_damp) call ibm_damp_init(n,ng,dl(1),ibm_damp_d,phi_s_sdf,phi_u_sdf,phi_v_sdf,phi_w_sdf,myid)
 #if defined (_OPENACC)
     !$acc enter data copyin(mask_u,mask_v,mask_w,mask_s)
 #endif

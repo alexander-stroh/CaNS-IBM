@@ -18,7 +18,8 @@ module mod_rk
                        momx_d_z ,momy_d_z ,momz_d_z, &
                        mom_xyz_ad
   use mod_param, only: is_impdiff,is_impdiff_1d,is_boussinesq_buoyancy,is_fast_mom_kernels,is_ibm,const_scal, &
-                       adv_form,bulk_vel_def
+                       adv_form,bulk_vel_def,is_ibm_damp,ibm_damp_eps
+  use mod_ibm_damp, only: ibm_damp_mom,ibm_damp_scal
   use mod_scal , only: scal,scal_cht,cmpt_scalflux,scalar
   use mod_cht  , only: cht_solve
   use mod_utils, only: bulk_mean,bulk_mean_ibm
@@ -172,6 +173,7 @@ module mod_rk
         call momz_a_vv(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,u,v,w,dwdtrk)
       end if
     end if
+    if(is_ibm_damp) call ibm_damp_mom(n,dli(1),ibm_damp_eps,u,v,w,dudtrk,dvdtrk,dwdtrk) ! x odd-even damping near the IB
     !
 #if !defined(_LOOP_UNSWITCHING)
     !$acc parallel loop collapse(3) default(present) async(1)
@@ -552,6 +554,7 @@ module mod_rk
     end if
     !
     call scal(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,alpha,u,v,w,s,dsdtrk,dsdtrkd)
+    if(is_ibm_damp) call ibm_damp_scal(n,dli(1),ibm_damp_eps,u,s,dsdtrk) ! x odd-even damping near the IB
     if(.not.const_scal) then
       !
       ! advection of the imposed mean gradient, -u*sgrad: part of the explicit rhs,

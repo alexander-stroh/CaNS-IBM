@@ -123,6 +123,13 @@ logical, protected :: is_impdiff = .false., is_impdiff_1d = .false., &
                       is_gridpoint_natural_channel = .false.
 character(len=3), protected :: adv_form = 'vv' ! advection form: 'vv' (skew-symmetric, Verstappen & Veldman) or 'div' (divergence)
 !
+! optional damping of the x odd-even (2 dx) mode near the immersed boundary (level-set geometry only, off by default):
+! rhs += -ibm_damp_eps*sigma*|u|*dx^3*d4/dx4 for u, v, w and the scalars, sigma = 1 for phi <= ibm_damp_d(1)*dx,
+! cosine ramp to 0 at phi = ibm_damp_d(2)*dx (phi: level set, > 0 in the fluid)
+!
+logical , protected :: is_ibm_damp = .false.
+real(rp), protected :: ibm_damp_eps = 0.02_rp, ibm_damp_d(2) = [3._rp,6._rp]
+!
 ! i/o backend parameters
 !
 character(len=16), protected :: io_backend = 'mpiio'
@@ -206,6 +213,7 @@ contains
                        is_impdiff,is_impdiff_1d, &
                        is_poisson_pcr_tdma, &
                        is_fast_mom_kernels, &
+                       is_ibm_damp,ibm_damp_eps,ibm_damp_d, &
                        is_gridpoint_natural_channel, &
                        adv_form
     namelist /other_options/ &
