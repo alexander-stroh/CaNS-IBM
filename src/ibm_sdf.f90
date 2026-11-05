@@ -33,6 +33,7 @@ module mod_ibm_sdf
   private
   public sdf_read,sdf_staggered,sdf_mask,set_ibm_2nd_sdf,calc_grad_dist_sdf,set_cht_geometry_sdf
   public frac_q,sdf_stag,sdf_point,sdf_taylor,sdf_taylor_eval
+  public sdf_interface_density
   contains
   subroutine sdf_read(fname,ng,lo,n,zc,ps)
     !
@@ -416,6 +417,46 @@ module mod_ibm_sdf
     end do
     if(myid == 0 .and. is_2nd) print*, 'CHT geometry (level set): cells with a sub-cell volume fraction (rank 0): ', ncut
   end subroutine set_cht_geometry_sdf
+  !
+  subroutine sdf_interface_density(n,dl,zc,dzf,ps,eps,adens,area)
+    !
+    ! interface area per unit volume at the cell centres from the level set (ps, two halo layers):
+    !
+    !   adens = delta_h(ps)*|grad ps|,   delta_h(d) = (1 + cos(pi*d/h))/(2*h) for |d| < h, 0 otherwise,
+    !
+    ! h = eps*max(dx,dy,dz(k)); the volume integral of adens is the interface area (exact for a plane with
+    ! a smooth, resolved delta); `area` returns that integral over the whole domain
+    !
+    implicit none
+    integer , intent(in), dimension(3) :: n
+    real(rp), intent(in), dimension(3) :: dl
+    real(rp), intent(in), dimension(0:) :: zc,dzf
+    real(rp), intent(in), dimension(-1:,-1:,-1:) :: ps
+    real(rp), intent(in) :: eps
+    real(rp), intent(out), dimension(0:,0:,0:) :: adens
+    real(rp), intent(out) :: area
+    real(rp), parameter :: pi = acos(-1._rp)
+    integer  :: i,j,k
+    real(rp) :: d,h,gx,gy,gz
+    adens(:,:,:) = 0._rp
+    area = 0._rp
+    do k=1,n(3)
+      h = eps*max(dl(1),dl(2),dzf(k))
+      do j=1,n(2)
+        do i=1,n(1)
+          d = ps(i,j,k)
+          if(abs(d) < h) then
+            gx = (ps(i+1,j,k)-ps(i-1,j,k))/(2._rp*dl(1))
+            gy = (ps(i,j+1,k)-ps(i,j-1,k))/(2._rp*dl(2))
+            gz = (ps(i,j,k+1)-ps(i,j,k-1))/(zc(k+1)-zc(k-1))
+            adens(i,j,k) = (1._rp + cos(pi*d/h))/(2._rp*h)*sqrt(gx**2 + gy**2 + gz**2)
+            area = area + adens(i,j,k)*dl(1)*dl(2)*dzf(k)
+          end if
+        end do
+      end do
+    end do
+    call MPI_ALLREDUCE(MPI_IN_PLACE,area,1,MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
+  end subroutine sdf_interface_density
   !
   function sdf_stag(ps,n,dzc,dzf,c,i,j,k,val) result(ok)
     !

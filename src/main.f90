@@ -94,9 +94,10 @@ program cans
   use mod_solve_helmholtz, only: solve_helmholtz,solve_helmholtz_ibm,rhs_bound
   use mod_cht            , only: cht_init
   use mod_ibm_sdf        , only: sdf_read,sdf_staggered,sdf_mask,set_ibm_2nd_sdf,calc_grad_dist_sdf, &
-                                 set_cht_geometry_sdf
+                                 set_cht_geometry_sdf,sdf_interface_density
   use mod_ibm_damp       , only: ibm_damp_init
   use mod_param          , only: is_ibm_damp,ibm_damp_d
+  use mod_param          , only: qw_ibm,qw_ibm_eps
 #if !defined(_OPENACC)
   use mod_solver         , only: solver
 #else
@@ -244,6 +245,9 @@ program cans
   real(rp), allocatable, dimension(:,:,:) :: thx,thy,thz,phi_cht
   logical  :: is_cht_any
   real(rp) :: alpha_max_eff
+  ! interfacial heat flux of CHT scalars (`qw_ibm`): interface area per unit volume at the cell centres
+  real(rp), allocatable, dimension(:,:,:) :: adens
+  real(rp) :: area_ib
   ! level-set geometry (`geometry = 'sdf'`): level set at the cell centres (two halo layers) and at the
   ! cell centres/velocity positions (one halo layer)
   logical  :: is_sdf
@@ -814,6 +818,28 @@ program cans
     end if
   endif
   !
+  ! interfacial heat flux of CHT scalars (`qw_ibm`, heat per unit interface area): interface area density
+  ! from the level set, a smoothed delta of half-width `qw_ibm_eps` grid spacings (see `sdf_interface_density`)
+  !
+  if(nscal > 0) then
+    if(any(qw_ibm(:) /= 0._rp)) then
+      if(.not.is_sdf) then
+        if(myid == 0) print*, 'ERROR: `qw_ibm /= 0` requires `geometry = ''sdf''`.'
+        if(myid == 0) print*, 'Aborting...'
+        call MPI_FINALIZE(ierr)
+        error stop
+      end if
+      allocate(adens(0:n(1)+1,0:n(2)+1,0:n(3)+1))
+      call sdf_interface_density(n,dl,zc,dzf,ps_sdf,qw_ibm_eps,adens,area_ib)
+      if(myid == 0) print*, '*** interfacial heat flux: interface area from the level set = ', area_ib, &
+                            ', delta half-width ', qw_ibm_eps, ' grid spacings ***'
+    end if
+  end if
+  if(.not.allocated(adens)) then
+    allocate(adens(0:0,0:0,0:0)); adens(:,:,:) = 0._rp ! unused
+  end if
+  !$acc enter data copyin(adens)
+  !
   ! optional output of the IBM/CHT geometry fields (interior cells, x fastest, serial runs only)
   !
   if(dump_ibm_geometry .and. is_ibm)then
@@ -1000,7 +1026,7 @@ program cans
                        s%is_forced,s%scalf,s%source,s%fluxo,s%dsdtrko,s%val,s%f,A_s,B_s, &
                        swz(:,iscal),scal_mean_grad(iscal),mask_s, &
                        is_cht=s%is_cht,alphas=s%alphas,cs_cf=s%cs_cf,ssource_s=s%source_s,cbcz=s%cbc(:,3), &
-                       thx=thx,thy=thy,thz=thz,phi=phi_cht)
+                       thx=thx,thy=thy,thz=thz,phi=phi_cht,qw=qw_ibm(iscal),adens=adens)
         else
         if(is_ibm) then
           call timer_tic('ibm_calc_a_b',nvtx_color='r',nvtx_gpu_stream=-1)

@@ -450,7 +450,7 @@ module mod_rk
   !
   subroutine rk_scal(rkpar,n,dli,l,dzci,dzfi,grid_vol_ratio_f,alpha,dt,is_bound,u,v,w, &
                      is_forced,scalf,ssource,fluxo,dsdtrko,s,f,A_s,B_s,sw,sgrad,mask_s, &
-                     is_cht,alphas,cs_cf,cbcz,thx,thy,thz,phi,ssource_s)
+                     is_cht,alphas,cs_cf,cbcz,thx,thy,thz,phi,ssource_s,qw,adens)
 #if defined(_OPENACC)
     use mod_common_cudecomp, only: dsdtrk_t => work
 #endif
@@ -459,6 +459,7 @@ module mod_rk
     ! (see `scal_cht`, `rk_scal_cht`); the diffusion is then either explicit or, with `is_impdiff`, fully
     ! implicit in all directions (delta form of Crank-Nicolson with approximate factorization, see
     ! `mod_cht`); the volumetric source acts in the fluid only (times the fluid volume fraction `phi`);
+    ! the interfacial heat flux `qw` is deposited as qw*adens, adens = interface area per unit volume;
     ! the 2nd-order IBM factors A_s/B_s, the wall value and the Helmholtz solve do not apply
     !
     ! low-storage 3rd-order Runge-Kutta scheme
@@ -503,7 +504,10 @@ module mod_rk
     real(rp) :: ssource_s_
     character(len=1), intent(in), dimension(0:1), optional :: cbcz
     real(rp), intent(in), dimension(0:,0:,0:), optional :: thx,thy,thz,phi
+    real(rp), intent(in), optional :: qw
+    real(rp), intent(in), dimension(0:,0:,0:), optional :: adens
     logical  :: is_cht_
+    real(rp) :: qw_
     !
     is_cht_ = .false.
     if(present(is_cht)) is_cht_ = is_cht
@@ -551,8 +555,15 @@ module mod_rk
       !
       ! all device loops of the CHT update work on non-optional dummy arguments (see `rk_scal_cht`)
       !
-      call rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas,cs_cf,ssource,ssource_s_, &
-                       is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f)
+      qw_ = 0._rp
+      if(present(qw).and.present(adens)) qw_ = qw
+      if(qw_ /= 0._rp) then
+        call rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas,cs_cf,ssource,ssource_s_, &
+                         is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_,adens)
+      else
+        call rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas,cs_cf,ssource,ssource_s_, &
+                         is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_,phi) ! adens unused
+      end if
       return
     end if
     !
@@ -663,7 +674,7 @@ module mod_rk
   end subroutine rk_scal
   !
   subroutine rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas_in,cs_cf_in,ssource_in,ssource_s_in, &
-                         is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f)
+                         is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_in,adens)
     !
     ! Runge-Kutta substep of a scalar with conjugate heat transfer (see `rk_scal`, `scal_cht`, `mod_cht`);
     ! all arguments are non-optional, and the scalar inputs are copied to locals, so that the
@@ -682,9 +693,11 @@ module mod_rk
     real(rp), intent(inout), dimension(:,:,:) :: dsdtrk,dsdtrkd,dsdtrko
     real(rp), intent(inout), dimension(0:,0:,0:) :: s
     real(rp), intent(out) :: f
-    real(rp) :: alphas,cs_cf,ss,sss,f1,f2,f12,capi,mean
+    real(rp), intent(in) :: qw_in                             ! interfacial heat flux (0: none)
+    real(rp), intent(in), dimension(0:,0:,0:) :: adens        ! interface area per unit volume (used if qw_in /= 0)
+    real(rp) :: alphas,cs_cf,ss,sss,f1,f2,f12,capi,mean,qw
     integer :: i,j,k
-    alphas = alphas_in; cs_cf = cs_cf_in; ss = ssource_in; sss = ssource_s_in
+    alphas = alphas_in; cs_cf = cs_cf_in; ss = ssource_in; sss = ssource_s_in; qw = qw_in
     f1 = factor1; f2 = factor2; f12 = factor12
     call scal_cht(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,alpha,alphas,cs_cf,u,v,w,thx,thy,thz,phi,s,dsdtrk,dsdtrkd)
     if(is_impdiff) then
@@ -700,7 +713,7 @@ module mod_rk
           do i=1,n(1)
             capi = 1._rp/(1._rp + (cs_cf-1._rp)*(1._rp-phi(i,j,k)))
             dsdtrkd(i,j,k) = f1*dsdtrk(i,j,k) + f2*dsdtrko(i,j,k) + &
-                             f12*((ss*phi(i,j,k) + sss*(1._rp-phi(i,j,k)))*capi + dsdtrkd(i,j,k))
+                             f12*((ss*phi(i,j,k) + sss*(1._rp-phi(i,j,k)) + qw*adens(i,j,k))*capi + dsdtrkd(i,j,k))
             dsdtrko(i,j,k) = dsdtrk(i,j,k)
           end do
         end do
@@ -722,7 +735,7 @@ module mod_rk
         do j=1,n(2)
           do i=1,n(1)
             capi = 1._rp/(1._rp + (cs_cf-1._rp)*(1._rp-phi(i,j,k)))
-            s(i,j,k) = s(i,j,k) + f1*dsdtrk(i,j,k) + f2*dsdtrko(i,j,k) + f12*(ss*phi(i,j,k) + sss*(1._rp-phi(i,j,k)))*capi
+            s(i,j,k) = s(i,j,k) + f1*dsdtrk(i,j,k) + f2*dsdtrko(i,j,k) + f12*(ss*phi(i,j,k) + sss*(1._rp-phi(i,j,k)) + qw*adens(i,j,k))*capi
             dsdtrko(i,j,k) = dsdtrk(i,j,k)
           end do
         end do

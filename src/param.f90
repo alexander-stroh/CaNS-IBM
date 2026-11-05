@@ -98,6 +98,13 @@ logical , protected, allocatable, dimension(:) :: is_cht ! size (nscal)
 real(rp), protected, allocatable, dimension(:) :: ks_kf  ! size (nscal)
 real(rp), protected, allocatable, dimension(:) :: cs_cf  ! size (nscal)
 !
+! interfacial heat flux (CHT scalars): heat released per unit interface area at the IB surface (flux jump
+! -k_s dT/dn|_s + qw_ibm = -k_f dT/dn|_f, n pointing into the fluid, cf. Liu & Hasegawa, Comput. Fluids 318
+! (2026) 107217), deposited with a smoothed delta of half-width qw_ibm_eps grid spacings about the zero level
+!
+real(rp), protected, allocatable, dimension(:) :: qw_ibm ! size (nscal)
+real(rp), protected :: qw_ibm_eps = 1.5_rp
+!
 #if defined(_OPENACC)
 !
 ! cuDecomp input parameters
@@ -206,6 +213,7 @@ contains
                      cbcscal_ibm,bcscal_ibm,bcscal_ibm_top,&
                      const_scal,scal_mean_grad,&
                      is_cht,ks_kf,cs_cf,&
+                     qw_ibm,qw_ibm_eps,&
                      ssource,ssource_s, &
                      is_sforced, &
                      scalf, &
@@ -372,7 +380,7 @@ contains
         allocate(alphai(nscal),iniscal(nscal), &
                  cbcscal(0:1,3,nscal),bcscal(0:1,3,nscal), &
                  cbcscal_ibm(nscal),bcscal_ibm(nscal),bcscal_ibm_top(nscal),&
-                 is_cht(nscal),ks_kf(nscal),cs_cf(nscal),&
+                 is_cht(nscal),ks_kf(nscal),cs_cf(nscal),qw_ibm(nscal),&
                  ssource(nscal),ssource_s(nscal),is_sforced(nscal),scalf(nscal),scal_mean_grad(nscal))
         !
         ! set default values
@@ -390,6 +398,7 @@ contains
         is_cht(:)      = .false.
         ks_kf(:)       = 1._rp
         cs_cf(:)       = 1._rp
+        qw_ibm(:)      = 0._rp
         !
         ! read `scalar` namelist
         !
@@ -513,6 +522,12 @@ contains
     ! checks of the CHT input (the `ibm` namelist is read after `scalar`)
     !
     if(nscal > 0) then
+      if(any(qw_ibm(:) /= 0._rp .and. .not.is_cht(:)).or.qw_ibm_eps <= 0._rp) then
+        if(myid == 0) print*, 'ERROR: reading the input file: `qw_ibm /= 0` requires `is_cht = T`, and `qw_ibm_eps > 0`.'
+        if(myid == 0) print*, 'Aborting...'
+        call MPI_FINALIZE(ierr)
+        error stop
+      end if
       if(any(is_cht(:))) then
         if(.not.is_ibm) then
           if(myid == 0) print*, 'ERROR: reading the input file: `is_cht = T` requires `is_ibm = T`.'
