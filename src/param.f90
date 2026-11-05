@@ -154,7 +154,11 @@ real(rp), protected   :: phase_l(0:1,3)=0._rp
 character(len=16), protected :: ibm_shape = 'macdonald' ! analytic wall shape: 'macdonald' or 'sinusoid'
 real(rp), protected   :: ibm_hch = -1._rp ! reference half height for the rough-wall grid (gtype = 5)
 character(len=16), protected :: bulk_vel_def = 'superficial' ! IBM bulk velocity: 'superficial' or 'intrinsic'
-character(len=16), protected :: ibm_proj = 'none' ! IB-aware velocity correction: 'none' or 'damped'
+character(len=16), protected :: ibm_proj = 'none' ! IB-aware velocity correction: 'none', 'damped' or 'masked'
+! masked projection (`ibm_proj = 'masked'`, see `mod_ibm_mproj`): relative residual and maximum number of the
+! preconditioned conjugate-gradient iterations per Runge-Kutta stage
+real(rp), protected :: mproj_tol = 1.e-3_rp
+integer , protected :: mproj_maxit = 50
 integer , protected   :: ibm_iout_wall = -1 ! interval of the per-point wall outputs (< 0: iout1d, 0: off)
 ! geometry of the IBM: 'analytic' (`isInbody`, wavy walls/height map) or 'sdf' (signed-distance level set
 ! at the cell centres read from `sdf_file`, see `mod_ibm_sdf`)
@@ -241,6 +245,7 @@ contains
                             ibm_hch,          &
                             bulk_vel_def,     &
                             ibm_proj,         &
+                            mproj_tol,mproj_maxit, &
                             ibm_iout_wall,    &
                             geometry,         &
                             sdf_file,         &

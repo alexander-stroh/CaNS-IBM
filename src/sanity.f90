@@ -91,8 +91,8 @@ module mod_sanity
     if(.not.any(trim(bulk_vel_def) == ['superficial','intrinsic  '])) then
       if(myid == 0)  print*, 'ERROR: `bulk_vel_def` must be either `superficial` or `intrinsic`.'; call abortit
     end if
-    if(.not.any(trim(ibm_proj) == ['none  ','damped'])) then
-      if(myid == 0)  print*, 'ERROR: `ibm_proj` must be either `none` or `damped`.'; call abortit
+    if(.not.any(trim(ibm_proj) == ['none  ','damped','masked'])) then
+      if(myid == 0)  print*, 'ERROR: `ibm_proj` must be `none`, `damped` or `masked`.'; call abortit
     end if
     if(trim(ibm_proj) /= 'none' .and. .not.is_ibm) then
       if(myid == 0)  print*, 'ERROR: `ibm_proj /= ''none''` requires `is_ibm = T`.'; call abortit

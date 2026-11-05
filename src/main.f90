@@ -37,6 +37,8 @@ program cans
   use mod_correc         , only: correc,correc_ibm
   use mod_fft            , only: fftini,fftend
   use mod_fillps         , only: fillps
+  use mod_ibm_mproj      , only: mproj_init,mproj_apply,mproj_dot,mproj_zero_closed,mproj_axpy,mproj_copy, &
+                                 mproj_zero_solid,mproj_set,mp_r,mp_z,mp_d,mp_q,mp_x,mp_it,mp_res,mp_it_sum,mp_ncall
   use mod_initflow       , only: initflow,initscal
   use mod_initgrid       , only: initgrid,save_grid
   use mod_initmpi        , only: initmpi
@@ -82,7 +84,7 @@ program cans
                                  amp_l,            &
                                  phase_l,          &
                                  bulk_vel_def,     &
-                                 ibm_proj,ibm_iout_wall, &
+                                 ibm_proj,ibm_iout_wall,mproj_tol,mproj_maxit, &
                                  ibm_hch,          &
                                  geometry,sdf_file,dump_ibm_geometry, &
                                  use_hmap,         &
@@ -150,6 +152,8 @@ program cans
   real(rp) :: dt,dti,dt_cfl,time,dtrk,dtrki,divtot,divmax
   real(rp) :: velmax_solid(3),divtot_m,divmax_m,ubulk_fl
   logical  :: is_ibm_force,is_ibm_map,is_first_stage,is_zero_vel
+  real(rp) :: mp_bn,mp_rn,mp_rz,mp_rzn,mp_al ! masked projection (PCG) scalars
+  integer  :: mp_k
   integer  :: iout_wall = 0 ! interval of the per-point IB wall outputs
   character(len=6) :: impart
   real(rp), allocatable, dimension(:,:,:) :: imp_map ! column-integrated IB force (x,y) of the lower wall
@@ -917,6 +921,7 @@ program cans
   !
   ! main loop
   !
+  if(is_ibm .and. trim(ibm_proj) == 'masked') call mproj_init(n,mask_u,mask_v,mask_w,myid)
   if(myid == 0) print*, '*** Calculation loop starts now ***'
   is_done = .false.
   is_first_stage = .true.
@@ -1140,9 +1145,52 @@ program cans
       !*******************!
       call fillps(n,dli,dzfi,dtrki,u,v,w,pp)
       call updt_rhs_b(['c','c','c'],cbcpre,n,is_bound,rhsbp%x,rhsbp%y,rhsbp%z,pp)
-      call solver(n,ng,arrplanp,normfftp,lambdaxyp,ap,bp,cp,cbcpre,['c','c','c'],pp,is_ptdma_update_p,ap_d,cp_d)
+      if(trim(ibm_proj) == 'masked') then
+        !
+        ! IB-consistent projection (see `mod_ibm_mproj`): D(M G pp) = rhs by conjugate gradients preconditioned
+        ! with the FFT solver of the plain Laplacian; x = 0 initially, so the first iterate is the plain solution
+        !
+        call mproj_copy(n,.false.,0._rp,pp,mp_r)
+        call mproj_zero_closed(n,mp_r)
+        call mproj_set(n,0._rp,mp_x)
+        mp_bn = sqrt(mproj_dot(n,mp_r,mp_r)); mp_rn = mp_bn; mp_it = 0
+        if(mp_bn > 0._rp) then
+          call mproj_copy(n,.false.,0._rp,mp_r,mp_z)
+          call solver(n,ng,arrplanp,normfftp,lambdaxyp,ap,bp,cp,cbcpre,['c','c','c'],mp_z,is_ptdma_update_p,ap_d,cp_d)
+          !$acc wait
+          call mproj_zero_closed(n,mp_z)
+          call boundp(cbcpre,n,bcpre,nb,is_bound,dl,dzc,mp_z)
+          mp_rz = mproj_dot(n,mp_r,mp_z)
+          call mproj_copy(n,.true.,0._rp,mp_z,mp_d)
+          do mp_k=1,mproj_maxit
+            call mproj_apply(n,dli,dzci,dzfi,mask_u,mask_v,mask_w,mp_d,mp_q)
+            mp_al = mp_rz/mproj_dot(n,mp_d,mp_q)
+            call mproj_axpy(n,.true. , mp_al,mp_d,mp_x)
+            call mproj_axpy(n,.false.,-mp_al,mp_q,mp_r)
+            mp_rn = sqrt(mproj_dot(n,mp_r,mp_r)); mp_it = mp_k
+            if(mp_rn <= mproj_tol*mp_bn) exit
+            call mproj_copy(n,.false.,0._rp,mp_r,mp_z)
+            call solver(n,ng,arrplanp,normfftp,lambdaxyp,ap,bp,cp,cbcpre,['c','c','c'],mp_z,is_ptdma_update_p,ap_d,cp_d)
+            !$acc wait
+            call mproj_zero_closed(n,mp_z)
+            call boundp(cbcpre,n,bcpre,nb,is_bound,dl,dzc,mp_z)
+            mp_rzn = mproj_dot(n,mp_r,mp_z)
+            call mproj_copy(n,.true.,mp_rzn/mp_rz,mp_z,mp_d)
+            mp_rz = mp_rzn
+          end do
+        end if
+        mp_res = mp_rn/max(mp_bn,tiny(1._rp)); mp_it_sum = mp_it_sum + mp_it; mp_ncall = mp_ncall + 1
+        call mproj_copy(n,.true.,0._rp,mp_x,pp)
+      else
+        call solver(n,ng,arrplanp,normfftp,lambdaxyp,ap,bp,cp,cbcpre,['c','c','c'],pp,is_ptdma_update_p,ap_d,cp_d)
+      end if
       call boundp(cbcpre,n,bcpre,nb,is_bound,dl,dzc,pp)
-      if(trim(ibm_proj) == 'damped') then
+      if(trim(ibm_proj) == 'masked') then
+        call correc(n,dli,dzci,dtrk,pp,u,v,w)
+        call mproj_zero_solid(n,mask_u,u)
+        call mproj_zero_solid(n,mask_v,v)
+        call mproj_zero_solid(n,mask_w,w)
+      else if(trim(ibm_proj) == 'damped') then
         call correc_ibm(n,dli,dzci,dtrk,pp,mask_u,mask_v,mask_w,A_u,A_v,A_w,u,v,w)
         if(is_ibm_force) call timer_tic('ibm_force',nvtx_color='m',nvtx_gpu_stream=-1)
         if(is_ibm_force) then
@@ -1216,6 +1264,11 @@ program cans
         if(myid == 0) print*, 'IBM: max|u,v,w| in solid = ', velmax_solid(:)
         if(myid == 0) print*, 'IBM: masked divergence norms: Mean = ', divtot_m, '| Maximum = ', divmax_m
         if(myid == 0) print*, 'IBM: fluid-only bulk velocity = ', ubulk_fl
+        if(trim(ibm_proj) == 'masked'.and.myid == 0) print*, 'IBM: masked projection: PCG iterations (last, mean) = ', &
+                                                            mp_it, 1._rp*mp_it_sum/max(mp_ncall,1), ', rel. residual ', mp_res
+        if(trim(ibm_proj) == 'masked') then
+          mp_it_sum = 0; mp_ncall = 0
+        end if
         var(1) = 1.*istep
         var(2) = time
         var(3:5) = velmax_solid(:)
@@ -1225,7 +1278,7 @@ program cans
         call out0d(trim(datadir)//'ibm_chk.out',8,var)
       end if
       if(.not.is_mask_divergence_check) then
-        if((divmax > small.and.trim(ibm_proj) /= 'damped').or.is_nan(divtot)) then
+        if((divmax > small.and..not.any(trim(ibm_proj) == ['damped','masked'])).or.is_nan(divtot)) then
           if(myid == 0) print*, 'ERROR: maximum divergence is too large.'
           if(myid == 0) print*, 'Aborting...'
           is_done = .true.
