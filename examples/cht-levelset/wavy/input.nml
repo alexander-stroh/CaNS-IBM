@@ -1,0 +1,82 @@
+&dns
+ng(1:3) = 32, 4, 32
+l(1:3) = 4., 0.5, 4.
+gtype = 1, gr = 0.
+cfl = 0.95, dtmax = 1.e5, dt_f = -1.
+visci = 100.
+inivel = 'zer'
+is_wallturb = F
+nstep = 100000000, time_max = 3000., tw_max = 47.
+stop_type(1:3) = F, T, T
+restart = F, is_overwrite_save = T, nsaves_max = 0
+icheck = 10, iout0d = 1000, iout1d = 100000000, iout2d = 0, iout3d = 0, isave = 100000000
+cbcvel(0:1,1:3,1) = 'P','P',  'P','P',  'D','D'
+cbcvel(0:1,1:3,2) = 'P','P',  'P','P',  'D','D'
+cbcvel(0:1,1:3,3) = 'P','P',  'P','P',  'D','D'
+cbcpre(0:1,1:3)   = 'P','P',  'P','P',  'N','N'
+bcvel(0:1,1:3,1) =  0.,0.,   0.,0.,   0.,0.
+bcvel(0:1,1:3,2) =  0.,0.,   0.,0.,   0.,0.
+bcvel(0:1,1:3,3) =  0.,0.,   0.,0.,   0.,0.
+bcpre(0:1,1:3)   =  0.,0.,   0.,0.,   0.,0.
+bforce(1:3) = 0.02, 0., 0.
+is_forced(1:3) = F, F, F
+velf(1:3) = 0., 0., 0.
+iaverage = 0, average_start_time = 1.e9
+gacc(1:3) = 0., 0., 0.
+nscal = 6
+dims(1:2) = 1, 1, ipencil_axis = 3
+/
+
+&scalar
+beta = 0.
+iniscal(:)  = 'zer', 'zer', 'zer', 'zer', 'zer', 'zer'
+alphai(:)   = 100., 100., 100., 100., 100., 100.
+cbcscal(0:1,1:3,1) = 'P','P',  'P','P',  'D','D'
+cbcscal(0:1,1:3,2) = 'P','P',  'P','P',  'D','D'
+cbcscal(0:1,1:3,3) = 'P','P',  'P','P',  'D','D'
+cbcscal(0:1,1:3,4) = 'P','P',  'P','P',  'D','D'
+cbcscal(0:1,1:3,5) = 'P','P',  'P','P',  'D','D'
+cbcscal(0:1,1:3,6) = 'P','P',  'P','P',  'D','D'
+bcscal(0:1,1:3,1)  =  0.,0.,   0.,0.,   0.,0.
+bcscal(0:1,1:3,2)  =  0.,0.,   0.,0.,   0.,0.
+bcscal(0:1,1:3,3)  =  0.,0.,   0.,0.,   0.,0.
+bcscal(0:1,1:3,4)  =  0.,0.,   0.,0.,   0.,0.
+bcscal(0:1,1:3,5)  =  0.,0.,   0.,0.,   0.,0.
+bcscal(0:1,1:3,6)  =  0.,0.,   0.,0.,   0.,0.
+ssource(:)    = 1., 1., 1., 1., 1., 1.
+is_sforced(:) = F, F, F, F, F, F
+scalf(:)      = 0., 0., 0., 0., 0., 0.
+is_cht(:)     = T, T, T, T, T, T
+ks_kf(:)      = 1., 10., 100., 0.1, 1., 1.
+cs_cf(:)      = 0.1, 0.1, 0.1, 0.1, 0.1, 0.1
+cbcscal_ibm(:) = 'D', 'D', 'D', 'D', 'D', 'D'
+bcscal_ibm(:)  = 0., 0., 0., 0., 0., 0.
+const_scal = T
+is_boussinesq_buoyancy = F
+/
+
+&cudecomp
+cudecomp_t_comm_backend = 1, cudecomp_is_t_enable_nccl = T, cudecomp_is_t_enable_nvshmem = F
+cudecomp_h_comm_backend = 2, cudecomp_is_h_enable_nccl = T, cudecomp_is_h_enable_nvshmem = F
+/
+
+&numerics
+is_impdiff = F, is_impdiff_1d = T
+is_poisson_pcr_tdma = F
+is_fast_mom_kernels = F
+/
+
+&other_options
+is_debug = F, is_timing = F
+/
+
+&io
+io_backend = 'mpiio'
+/
+
+&ibm
+is_ibm = T
+geometry = 'sdf'
+sdf_file = 'data/sdfp.bin'
+ibm_iout_wall = 0
+/
