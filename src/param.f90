@@ -134,6 +134,7 @@ character(len=16), protected :: ibm_updiss_mode = 'none' ! upwind dissipation ne
 real(rp), protected   :: ibm_updiss = 1._rp ! its coefficient c
 integer , protected   :: ibm_updiss_ncell = 3 ! layer width in fluid cells from the immersed wall ...
 integer , protected   :: ibm_updiss_ntaper = 0 ! ... and the width of its cosine taper in cells
+logical , protected   :: ibm_updiss_scal = .false. ! the same term also for the scalars
 integer , protected   :: ibm_iout_wall = -1 ! interval of the per-point wall outputs (< 0: iout1d)
 !hmap
 logical,protected     :: use_hmap=.false.
@@ -215,7 +216,8 @@ contains
                             ibm_updiss_mode,  &
                             ibm_updiss,       &
                             ibm_updiss_ncell, &
-                            ibm_updiss_ntaper
+                            ibm_updiss_ntaper,&
+                            ibm_updiss_scal
     namelist /hmap/ &
                             use_hmap,         &
                             hmap_mode,        &        

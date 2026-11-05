@@ -21,7 +21,7 @@ module mod_sanity
   use mod_param     , only: ipencil_axis,is_impdiff,is_impdiff_1d,is_poisson_pcr_tdma,small,adv_form, &
                             is_ibm,nscal,cbcscal_ibm,bulk_vel_def, &
                             ibm_shape,use_hmap,ibm_direction,amp_l,phase_l,ibm_proj, &
-                            ibm_updiss_mode,ibm_updiss,ibm_updiss_ncell,ibm_updiss_ntaper
+                            ibm_updiss_mode,ibm_updiss,ibm_updiss_ncell,ibm_updiss_ntaper,ibm_updiss_scal
 #if !defined(_OPENACC)
   use mod_solver    , only: solver
 #else
@@ -110,6 +110,9 @@ module mod_sanity
       if(.not.is_ibm) then
         if(myid == 0)  print*, 'ERROR: `ibm_updiss_mode /= ''none''` requires `is_ibm = T`.'; call abortit
       end if
+    end if
+    if(ibm_updiss_scal .and. trim(ibm_updiss_mode) == 'none') then
+      if(myid == 0)  print*, 'ERROR: `ibm_updiss_scal = T` requires `ibm_updiss_mode /= ''none''`.'; call abortit
     end if
     if(is_ibm .and. nscal > 0) then
       if(any(cbcscal_ibm(1:nscal) /= 'D')) then

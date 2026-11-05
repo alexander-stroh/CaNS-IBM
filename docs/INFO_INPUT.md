@@ -396,6 +396,7 @@ ibm_updiss_mode = 'none'
 ibm_updiss   = 1.
 ibm_updiss_ncell = 3
 ibm_updiss_ntaper = 0
+ibm_updiss_scal = F
 /
 ```
 `ibm_shape` selects the analytic wall shape (with `&hmap use_hmap = F`). For a wall normal to direction `t` on side `s` (`ibm_direction(s,t) = T`), with in-plane directions `i = mod(t,3)+1` and `ii = mod(t+1,3)+1`, and the bottom wall at `l_0(0,t) + h`, the top wall at `l_0(1,t) - h`:
@@ -418,6 +419,8 @@ In tests (turbulent channel over the MacDonald wall, 64^3) the two options give 
 
 * `'none'`: no term (default); nothing is allocated or computed.
 * `'body'`: the term acts with the weight `phi` in [0,1] of a layer around the immersed wall, grown from the IB mask of each velocity component: level 1 are the fluid points with a solid neighbour (the points carrying IB coefficients), level `m` the fluid points next to level `m-1`, neighbours counted in all 26 directions so that the layer is isotropic in grid cells. `phi = 1` up to level `ibm_updiss_ncell`, then a cosine taper over a further `ibm_updiss_ntaper` levels (solid points: 1). The layer depends neither on the geometry nor on the wall orientation, and shrinks with the grid. The term is computed only on the layer points.
+
+`ibm_updiss_scal = T` (default `F`; requires `ibm_updiss_mode /= 'none'`) adds the same term, with the same layer grown from the scalar mask, to the scalar equations, with the velocity components at the cell faces as advection velocities. Without it only the momentum is damped, while the scalar keeps the central advection next to the sharp IB.
 
 `ibm_iout_wall` is the interval, in time steps, of the per-point wall outputs `fric-*`, `pressure*`, `FV-fric_*` and `ibm_wall_stress_*` below. A negative value (default) uses `iout1d`; `0` switches them off. The plane statistics `turb_stats_*` stay at `iout1d`. On fine grids the per-cell files are large (one line per cut cell), so a larger interval than `iout1d` keeps the statistics frequent without them.
 

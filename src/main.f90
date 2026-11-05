@@ -593,7 +593,7 @@ program cans
 #endif
     allocate(imp_map(n(1),n(2),2))
     !$acc enter data create(imp_map)
-    if(trim(ibm_updiss_mode) /= 'none') call updiss_init(n,dl,dzc,dzf,mask_u,mask_v,mask_w, &
+    if(trim(ibm_updiss_mode) /= 'none') call updiss_init(n,dl,dzc,dzf,mask_u,mask_v,mask_w,mask_s, &
                                                         cbcpre,bcpre,nb,is_bound)
   endif
   if(is_ibm)then
