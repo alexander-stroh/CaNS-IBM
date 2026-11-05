@@ -2,6 +2,7 @@ module mod_ibm
     use mod_types 
     use mod_param
     use mod_thakkar
+    use mod_ibm_sdf, only: frac_q,sdf_stag,sdf_point,sdf_taylor,sdf_taylor_eval
     use decomp_2d, only: update_halo
     implicit none
     !
@@ -18,7 +19,12 @@ module mod_ibm
     real(rp), allocatable, dimension(:,:,:)   :: wf_tw        ! (wf_ntmax,np,c)
     real(rp), allocatable, dimension(:,:,:,:) :: wf_imp       ! (0:n1+1,0:n2+1,0:n3+1,c)
     logical , allocatable, dimension(:,:,:)   :: wf_cell      ! cells that may hold wall force
-    contains 
+    !
+    ! wall heat flux per cell (`FV-heat` output, see `calc_wall_heat`): per scalar, the heat flow from
+    ! the fluid into the wall, and the interface temperature times and the area of the crossed faces
+    !
+    real(rp), allocatable, dimension(:,:,:,:) :: wh_q         ! (0:n1+1,0:n2+1,0:n3+1,3*nscal)
+    contains
     ! we initalize the ibm coef. here
     ! at the main.f90
     ! check if the real location(x,y,z) is in the given body shape 
@@ -1144,7 +1150,12 @@ module mod_ibm
     subroutine init_fric_cubes(band_s,mask_s,lo,dl,zc,zf,dzc,&
                                         dzf,xg,yg,dix,diy,diz,ibm_direction,amp_l,&
                                         n_wave,l_0,phase_l,n,l,hmap,l1_hmap,l2_hmap,&
-                                        n1_hmap,n2_hmap,output)
+                                        n1_hmap,n2_hmap,output,ps,ze)
+        !
+        ! sub-cell geometry of the cells that may hold wall force (`get_fric_cubes`); with the level-set
+        ! geometry (ps, ze as in `init_wall_force`), the solid test of the sub-cells is the sign of the
+        ! local quadratic expansion of the level set about the cell centre (`sdf_taylor`)
+        !
         logical, intent(in),dimension(0:,0:,0:)             :: band_s
         logical,intent(in)                                  :: mask_s(0:,0:,0:)
         integer,intent(in),dimension(3)                     :: lo
@@ -1162,15 +1173,25 @@ module mod_ibm
         integer,intent(in),optional                         :: n1_hmap,n2_hmap
         integer,intent(in)                                  :: dix,diy,diz
         real(rp),intent(inout),dimension(0:,0:,0:,:)        :: output
+        real(rp),intent(in),optional,dimension(-1:,-1:,-1:) :: ps
+        real(rp),intent(in),optional,dimension(-1:)         :: ze
         integer                                             :: i,j,k
+        real(rp)                                            :: coef(10)
         output(:,:,:,:) = 0._rp;
         do k=lbound(band_s,3)+1,ubound(band_s,3)-1
             do j=lbound(band_s,2)+1,ubound(band_s,2)-1
                 do i=lbound(band_s,1)+1,ubound(band_s,1)-1
                     if(band_s(i,j,k))then
+                        if(present(ps)) then
+                            call sdf_taylor(ps,i,j,k,dl,ze,coef)
+                            call get_fric_cubes(band_s,i,j,k,mask_s,lo,dl,zc,zf,dzc,dzf,xg,yg,dix,diy,diz,&
+                                                ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,hmap,l1_hmap,&
+                                                l2_hmap,n1_hmap,n2_hmap,output,coef)
+                        else
                         call get_fric_cubes(band_s,i,j,k,mask_s,lo,dl,zc,zf,dzc,dzf,xg,yg,dix,diy,diz,&
                                             ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,hmap,l1_hmap,&
                                             l2_hmap,n1_hmap,n2_hmap,output)
+                        end if
                     endif
                 end do 
             end do
@@ -1179,7 +1200,7 @@ module mod_ibm
 
     end subroutine init_fric_cubes
     subroutine get_fric_cubes(band_s,i,j,k,mask_s,lo,dl,zc,zf,dzc,dzf,xg,yg,dix,diy,diz,ibm_direction,amp_l,n_wave,l_0,&
-        phase_l,n,l,hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap,output)
+        phase_l,n,l,hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap,output,coef)
         logical, intent(in),dimension(0:,0:,0:)             :: band_s
         logical,intent(in)                                  :: mask_s(0:,0:,0:)
         integer,intent(in),dimension(3)                     :: lo
@@ -1212,7 +1233,8 @@ module mod_ibm
         real(rp),dimension(2,3)                             :: A_inlets
         real(rp)                                            :: A_tot 
         real(rp),intent(inout),dimension(0:,0:,0:,:)          :: output
-        logical :: diag,inloop
+        real(rp),intent(in),optional                        :: coef(10) ! level set: local expansion (`sdf_taylor`)
+        logical :: diag,inloop,is_in
         !options
         diag=.false.;inloop=.false.;
         s_xp=0;s_xm=0;s_yp=0;s_ym=0;s_zp=0;s_zm=0;
@@ -1231,8 +1253,8 @@ module mod_ibm
             ! now lets check the inside of the band point with smaller cubes
             dz_int=dzf(k);dy_int=(yg(j)-yg(j-1));dx_int=(xg(i)-xg(i-1))!get dx,dy,dz from global
             A_dx=dy_int*dz_int/nsub**2;A_dy=dx_int*dz_int/nsub**2;A_dz=dx_int*dy_int/nsub**2
-            if(.not.any(ibm_direction(:,1:2))) then
-              ! z-walls only: the solid test is monotone in z, so the wall heights are evaluated
+            if(.not.present(coef) .and. .not.any(ibm_direction(:,1:2))) then
+              ! analytic z-walls only: the solid test is monotone in z, so the wall heights are evaluated
               ! once per sub-column (the same comparisons as in isInbody)
               do jc=1,nsub
                 y_int=y-0.5_rp*dy_int+(real(jc,kind=rp)-0.5_rp)/nsub*dy_int
@@ -1259,8 +1281,13 @@ module mod_ibm
                     y_int=y-0.5_rp*dy_int+(real(jc,kind=rp)-0.5_rp)/nsub*dy_int
                     do ic=1,nsub
                         x_int=x-0.5_rp*dx_int+(real(ic,kind=rp)-0.5_rp)/nsub*dx_int
-                        if(isInbody(ibm_direction,amp_l,n_wave,l_0,phase_l,x_int,y_int,z_int,n,l,&
-                                    hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap))then
+                        if(present(coef)) then
+                            is_in = sdf_taylor_eval(coef,x_int-x,y_int-y,z_int-z) <= 0._rp
+                        else
+                            is_in = isInbody(ibm_direction,amp_l,n_wave,l_0,phase_l,x_int,y_int,z_int,n,l,&
+                                             hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap)
+                        end if
+                        if(is_in)then
                             mask_subcell(ic,jc,kc)=.true. ! this subcell is in solid
                             co=co+1
                         endif
@@ -1440,7 +1467,7 @@ module mod_ibm
         endif
     end subroutine get_fric_cubes
     subroutine init_wall_force(n,lo,l,dl,zc,zf,dzc,dzf,mask_u,mask_v,mask_w,mask_s,ibm_direction,amp_l,n_wave,l_0,phase_l,&
-                               hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap)
+                               hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap,ps,ze)
         !
         ! set-up of the exact wall force per cell (`wf_gather`, `wf_scatter`, `calc_wall_force`):
         !  - wf_cell: the cells next to the fluid/solid interface (both kinds in their 3x3x3 neighbourhood)
@@ -1449,6 +1476,10 @@ module mod_ibm
         !    directions with the weights lambda_d/lambda (band) or 1/h_d^2 (solid), and each direction
         !    goes to the cell that contains the wall point between the two nodes (`calc_lambda`);
         !    a wall point on a face normal to the staggered direction is split between the two cells
+        ! with the level-set geometry (ps: cell-centred level set with two halo layers, ze(-1:n(3)+2) the
+        ! cell-centre z coordinates), the wall point between two nodes is the root of the quadratic
+        ! interpolant of the level set of `set_ibm_2nd_sdf` (`frac_q`, the same lambda as the IBM), seen
+        ! from the fluid node; the side of a point is the sign of the trilinear interpolant (`sdf_point`)
         !
         integer , intent(in), dimension(3)        :: n,lo
         real(rp), intent(in), dimension(3)        :: l,dl
@@ -1462,12 +1493,15 @@ module mod_ibm
         real(rp), intent(in), optional            :: hmap(0:,0:)
         real(rp), intent(in), optional            :: l1_hmap,l2_hmap
         integer , intent(in), optional            :: n1_hmap,n2_hmap
+        real(rp), intent(in), optional, dimension(-1:,-1:,-1:) :: ps
+        real(rp), intent(in), optional, dimension(-1:)          :: ze
         logical , allocatable, dimension(:,:,:)   :: mask
         integer  :: c,i,j,k,d,ax,a,ip,nt,npmax,own(3),idx,ie(3),dix,diy,diz
         real(rp) :: x,y,z,xp,xm,yp,ym,zp,zm,pos(3),xn(3),lam,wsum,wd(6),wl(3,6),dzf_l,dzc_l,wcoord
-        logical  :: has(6),is_solid,is_split,in_cell(-1:1)
+        logical  :: has(6),is_solid,is_split,in_cell(-1:1),is_sdf
         integer  :: sgn
         real(rp) :: xs(3),xs2(3)
+        is_sdf = present(ps)
         allocate(wf_cell(0:n(1)+1,0:n(2)+1,0:n(3)+1))
         wf_cell(:,:,:) = .false.
         do k=1,n(3)
@@ -1532,7 +1566,11 @@ module mod_ibm
                                     dzf_l = dzf(k); dzc_l = dzc(k)
                                 end if
                             end if
-                            if(.not.is_solid) then
+                            if(is_sdf) then
+                                call cross_sdf(c,i,j,k,d,is_solid,lam,wl(:,d))
+                                wd(d) = lam
+                                if(is_solid) wd(d) = 1._rp/(xn(ax)-pos(ax))**2
+                            else if(.not.is_solid) then
                                 call calc_lambda(pos(1),pos(2),pos(3),xn(ax),ax,lam,ibm_direction,amp_l,n_wave,l_0,phase_l, &
                                                  n,l,dl,hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap,dzf_l,dzc_l,diz,wl(:,d))
                                 wd(d) = lam
@@ -1587,10 +1625,15 @@ module mod_ibm
                                 do sgn=-1,1,2
                                     xs(:) = pos(:); xs(c) = pos(c) + sgn*0.25_rp*h_c(c,k,sgn)
                                     xs2(:) = xn(:); xs2(c) = xs(c)
+                                    if(is_sdf) then
+                                        in_cell(sgn) = (sdf_point(ps,lo,n,dl,ze,xs(1) ,xs(2) ,xs(3) ) <= 0._rp).neqv. &
+                                                       (sdf_point(ps,lo,n,dl,ze,xs2(1),xs2(2),xs2(3)) <= 0._rp)
+                                    else
                                     in_cell(sgn) = isInbody(ibm_direction,amp_l,n_wave,l_0,phase_l,xs(1),xs(2),xs(3),n,l, &
                                                             hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap).neqv. &
                                                    isInbody(ibm_direction,amp_l,n_wave,l_0,phase_l,xs2(1),xs2(2),xs2(3),n,l, &
                                                             hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap)
+                                    end if
                                 end do
                                 if(.not.any(in_cell)) in_cell(-1:1:2) = .true. ! wall along the face
                                 do sgn=-1,1,2
@@ -1610,6 +1653,74 @@ module mod_ibm
         end do
         !$acc enter data copyin(wf_cell,wf_ijk,wf_nt,wf_tc,wf_tw,wf_imp)
     contains
+        subroutine cross_sdf(c,i,j,k,d,is_solid,lam,wl)
+            !
+            ! level-set geometry: wall point wl on the segment from node (i,j,k) of component c to its
+            ! neighbour in direction d, and (band node) the lambda of `set_ibm_2nd_sdf`; the fraction of
+            ! the segment in the fluid, seen from the fluid node f towards the solid node, is the root of
+            ! the quadratic interpolant through f, the solid node and the node beyond f (linear if that node
+            ! is outside the range of ps)
+            !
+            integer , intent(in)  :: c,i,j,k,d
+            logical , intent(in)  :: is_solid
+            real(rp), intent(out) :: lam,wl(3)
+            real(rp), parameter :: eps = 1.e-10_rp
+            integer  :: e(3),f(3),b(3),ax,dz
+            real(rp) :: pf,pn,pm,hn,hm,th,hl,xl,yl,zl,xlp,xlm,ylp,ylm,zlp,zlm
+            logical  :: ok
+            ax = (d+1)/2
+            e(:) = 0; e(ax) = merge(1,-1,mod(d,2) == 1)
+            if(.not.is_solid) then
+                f = [i,j,k]           ! fluid node: this one, solid neighbour f+e
+            else
+                f = [i,j,k]+e(:); e(:) = -e(:) ! fluid node: the neighbour, solid node f+e = this one
+            end if
+            b(:) = f(:)-e(:)          ! node beyond the fluid node
+            ok = sdf_stag(ps,n,dzc,dzf,c,f(1),f(2),f(3),pf)
+            ok = sdf_stag(ps,n,dzc,dzf,c,f(1)+e(1),f(2)+e(2),f(3)+e(3),pn)
+            if(.not.sdf_stag(ps,n,dzc,dzf,c,b(1),b(2),b(3),pm)) pm = -1._rp ! -> linear
+            !
+            ! node spacings from f towards the solid node (hn) and towards b (hm), as in `set_ibm_2nd_sdf`
+            !
+            dz = merge(1,0,c == 3)
+            if(ax < 3) then
+                hn = dl(ax); hm = dl(ax)
+            else
+                hn = zspc(f(3),e(3)); hm = zspc(f(3),-e(3))
+                if(hm <= 0._rp) pm = -1._rp
+            end if
+            th = max(frac_q(pf,pn,pm,hn,hm),eps)
+            lam = 0._rp
+            if(.not.is_solid) then
+                if(ax < 3) then
+                    hl = dl(ax)**2
+                else if(e(3) > 0) then  ! dzc*dzf as in `set_ibm_2nd_sdf`
+                    hl = merge(dzc(k)*dzf(k)  ,dzf(k+1)*dzc(k),dz == 0)
+                else
+                    hl = merge(dzc(k-1)*dzf(k),dzf(k)*dzc(k)  ,dz == 0)
+                end if
+                lam = (1._rp/hl)*(1._rp/th-1._rp)
+            end if
+            !
+            ! wall point: from the fluid node, the fraction th of the segment towards the solid node
+            !
+            call get_grid_loc(lo,f(1),f(2),f(3),dl,zc,zf,dix,diy,diz,xl,yl,zl,xlp,xlm,ylp,ylm,zlp,zlm)
+            wl(:) = [xl,yl,zl]
+            wl(ax) = wl(ax) + e(ax)*th*hn
+        end subroutine cross_sdf
+        real(rp) function zspc(kk,s)
+            ! spacing along z from node kk to node kk+s (s = +-1) of the z grid of component c
+            ! (zc: dzc; zf (w): dzf), as in `set_ibm_2nd_sdf`; 0 if out of range
+            integer, intent(in) :: kk,s
+            integer :: km
+            km = min(kk,kk+s)          ! the segment between nodes km and km+1
+            zspc = 0._rp
+            if(diz == 0) then
+                if(km >= 0 .and. km <= n(3)+1) zspc = dzc(km)
+            else
+                if(km+1 >= 0 .and. km+1 <= n(3)+1) zspc = dzf(km+1)
+            end if
+        end function zspc
         real(rp) function h_c(c,k,sgn)
             ! width, along c, of the cell on side sgn of the staggered point (cells k, k+1 along z)
             integer, intent(in) :: c,k,sgn
@@ -1746,20 +1857,22 @@ module mod_ibm
         end do
     end subroutine wf_scatter
     !
-    subroutine wf_halo_add(n)
+    subroutine wf_halo_add(n,a)
         !
-        ! adds the impulse accumulated in the halo cells to the cells of the neighbouring tasks
-        ! (periodic wrap along the pencil axis), then clears the halos; host data
+        ! adds the quantity accumulated in the halo cells of a (e.g. the impulse wf_imp) to the cells of
+        ! the neighbouring tasks (periodic wrap along the pencil axis), then clears the halos; host data
         !
         use mpi
         integer, intent(in), dimension(3) :: n
+        real(rp), intent(inout), dimension(0:,0:,0:,:) :: a
         real(rp), allocatable, dimension(:,:,:,:) :: sb,rb
-        integer :: idir,ierr,nn,nbr(0:1)
+        integer :: idir,ierr,nn,nbr(0:1),nc
+        nc = size(a,4)
         do idir=1,3
             select case(idir)
-            case(1); allocate(sb(1,0:n(2)+1,0:n(3)+1,3),rb(1,0:n(2)+1,0:n(3)+1,3))
-            case(2); allocate(sb(0:n(1)+1,1,0:n(3)+1,3),rb(0:n(1)+1,1,0:n(3)+1,3))
-            case(3); allocate(sb(0:n(1)+1,0:n(2)+1,1,3),rb(0:n(1)+1,0:n(2)+1,1,3))
+            case(1); allocate(sb(1,0:n(2)+1,0:n(3)+1,nc),rb(1,0:n(2)+1,0:n(3)+1,nc))
+            case(2); allocate(sb(0:n(1)+1,1,0:n(3)+1,nc),rb(0:n(1)+1,1,0:n(3)+1,nc))
+            case(3); allocate(sb(0:n(1)+1,0:n(2)+1,1,nc),rb(0:n(1)+1,0:n(2)+1,1,nc))
             end select
             nn = size(sb)
             if(idir == ipencil_axis) then
@@ -1779,9 +1892,9 @@ module mod_ibm
                 call wf_add_plane(idir,n(idir),rb)
             end if
             select case(idir)
-            case(1); wf_imp(0,:,:,:) = 0._rp; wf_imp(n(1)+1,:,:,:) = 0._rp
-            case(2); wf_imp(:,0,:,:) = 0._rp; wf_imp(:,n(2)+1,:,:) = 0._rp
-            case(3); wf_imp(:,:,0,:) = 0._rp; wf_imp(:,:,n(3)+1,:) = 0._rp
+            case(1); a(0,:,:,:) = 0._rp; a(n(1)+1,:,:,:) = 0._rp
+            case(2); a(:,0,:,:) = 0._rp; a(:,n(2)+1,:,:) = 0._rp
+            case(3); a(:,:,0,:) = 0._rp; a(:,:,n(3)+1,:) = 0._rp
             end select
             deallocate(sb,rb)
         end do
@@ -1790,18 +1903,18 @@ module mod_ibm
             integer, intent(in) :: idir,m
             real(rp), allocatable, dimension(:,:,:,:) :: pl
             select case(idir)
-            case(1); pl = wf_imp(m:m,:,:,:)
-            case(2); pl = wf_imp(:,m:m,:,:)
-            case(3); pl = wf_imp(:,:,m:m,:)
+            case(1); pl = a(m:m,:,:,:)
+            case(2); pl = a(:,m:m,:,:)
+            case(3); pl = a(:,:,m:m,:)
             end select
         end function wf_get_plane
         subroutine wf_add_plane(idir,m,pl)
             integer, intent(in) :: idir,m
             real(rp), intent(in), dimension(:,:,:,:) :: pl
             select case(idir)
-            case(1); wf_imp(m:m,:,:,:) = wf_imp(m:m,:,:,:) + pl
-            case(2); wf_imp(:,m:m,:,:) = wf_imp(:,m:m,:,:) + pl
-            case(3); wf_imp(:,:,m:m,:) = wf_imp(:,:,m:m,:) + pl
+            case(1); a(m:m,:,:,:) = a(m:m,:,:,:) + pl
+            case(2); a(:,m:m,:,:) = a(:,m:m,:,:) + pl
+            case(3); a(:,:,m:m,:) = a(:,:,m:m,:) + pl
             end select
         end subroutine wf_add_plane
     end subroutine wf_halo_add
@@ -1829,7 +1942,7 @@ module mod_ibm
         integer  :: i,j,k,nc
         !$acc wait(1)
         !$acc update self(wf_imp)
-        call wf_halo_add(n)
+        call wf_halo_add(n,wf_imp)
         !
         ! a cell without wall area (by the sub-cell sampling, e.g. a solid cell whose wall lies
         ! within the sampling distance of a face) passes its force to the face neighbours of
@@ -1853,7 +1966,7 @@ module mod_ibm
                 end do
             end do
         end do
-        call wf_halo_add(n)
+        call wf_halo_add(n,wf_imp)
         nc = 0
         do k=1,n(3)
             do j=1,n(2)
@@ -1885,6 +1998,165 @@ module mod_ibm
         wf_imp(:,:,:,:) = 0._rp
         !$acc update device(wf_imp)
     end subroutine calc_wall_force
+    !
+    subroutine calc_wall_heat(m,nscal,n,lo,ng,is_per,dl,dzc,dzf,mask_s,thx,thy,thz,s,kf,ks,is_cht,tw)
+        !
+        ! wall heat flux of scalar m per cell (`FV-heat` output), from the diffusive fluxes of the
+        ! discretisation across the centre-to-centre segments cut by the interface (fluid centre f, solid
+        ! centre s, length h, fraction th in the fluid, from thx, thy, thz as in `scal_cht`), positive from
+        ! the fluid into the wall:
+        !  - CHT: the fluid (conductivity k_f) and solid (k_s) parts of the segment in series, as the face
+        !    conductivity of `scal_cht`:
+        !      q = (T_f - T_s)/(th*h/k_f + (1-th)*h/k_s),  T_i = T_f - q*th*h/k_f = T_s + q*(1-th)*h/k_s,
+        !    i.e. the flux is continuous at the interface, with the gradient q/k_f on the fluid and q/k_s on
+        !    the solid side
+        !  - no CHT: the 2nd-order IBM, a linear profile from the fluid node to the wall value T_w at the
+        !    distance th*h:  q = k_f*(T_f - T_w)/(th*h),  T_i = T_w
+        ! the heat flow q*A_face goes to the cell that contains the interface point; accumulated in
+        ! wh_q(:,:,:,3*m-2:3*m) = [heat flow, T_i*A_face, A_face]; segments from the local cells 1..n to
+        ! their + neighbour (that across the domain boundary only if periodic), so that each counts once
+        ! (halo cells: see `wall_heat_out`); host data
+        !
+        integer , intent(in), dimension(3)        :: n,lo,ng
+        integer , intent(in)                      :: m,nscal
+        logical , intent(in), dimension(3)        :: is_per
+        real(rp), intent(in), dimension(3)        :: dl
+        real(rp), intent(in), dimension(0:)       :: dzc,dzf
+        logical , intent(in), dimension(0:,0:,0:) :: mask_s
+        real(rp), intent(in), dimension(0:,0:,0:) :: thx,thy,thz,s
+        real(rp), intent(in)                      :: kf,ks
+        real(rp), intent(in), dimension(0:)       :: tw ! wall value per level k
+        logical , intent(in)                      :: is_cht
+        real(rp), parameter :: eps = 1.e-10_rp
+        integer  :: ax,i,j,k,ie(3),imax(3),f(3),sc(3),o(3),mc
+        real(rp) :: th,h,af,dface,q,ti
+        if(.not.allocated(wh_q)) then
+            allocate(wh_q(0:n(1)+1,0:n(2)+1,0:n(3)+1,3*nscal))
+            wh_q(:,:,:,:) = 0._rp
+        end if
+        mc = 3*(m-1)
+        do ax=1,3
+            ie(:) = 0; ie(ax) = 1
+            imax(:) = n(:)
+            if(.not.is_per(ax) .and. lo(ax)+n(ax)-1 == ng(ax)) imax(ax) = n(ax)-1
+            do k=1,imax(3)
+                do j=1,imax(2)
+                    do i=1,imax(1)
+                        if(mask_s(i,j,k).eqv.mask_s(i+ie(1),j+ie(2),k+ie(3))) cycle
+                        if(.not.mask_s(i,j,k)) then
+                            f = [i,j,k]; sc = f+ie
+                        else
+                            sc = [i,j,k]; f = sc+ie
+                        end if
+                        select case(ax)
+                        case(1); th = thx(i,j,k); h = dl(1); af = dl(2)*dzf(k); dface = 0.5_rp*h
+                        case(2); th = thy(i,j,k); h = dl(2); af = dl(1)*dzf(k); dface = 0.5_rp*h
+                        case(3); th = thz(i,j,k); h = dzc(k); af = dl(1)*dl(2); dface = 0.5_rp*dzf(f(3))
+                        end select
+                        if(is_cht) then
+                            q  = (s(f(1),f(2),f(3))-s(sc(1),sc(2),sc(3)))/(th*h/kf + (1._rp-th)*h/ks)
+                            ti = s(f(1),f(2),f(3)) - q*th*h/kf
+                        else
+                            th = max(th,eps)
+                            q  = kf*(s(f(1),f(2),f(3))-tw(sc(3)))/(th*h)
+                            ti = tw(sc(3))
+                        end if
+                        o = merge(f,sc,th*h <= dface) ! cell that contains the interface point
+                        wh_q(o(1),o(2),o(3),mc+1) = wh_q(o(1),o(2),o(3),mc+1) + q*af
+                        wh_q(o(1),o(2),o(3),mc+2) = wh_q(o(1),o(2),o(3),mc+2) + ti*af
+                        wh_q(o(1),o(2),o(3),mc+3) = wh_q(o(1),o(2),o(3),mc+3) + af
+                    end do
+                end do
+            end do
+        end do
+    end subroutine calc_wall_heat
+    !
+    subroutine wall_heat_out(n,lo,nscal,mask_s,cubeInput,output,qtot)
+        !
+        ! per-cell wall heat flux of all scalars (accumulated by `calc_wall_heat`) for the cells with wall
+        ! area, in the order of `calc_wall_force`: the halo contributions are added to the neighbouring
+        ! tasks, and a cell without wall area passes its part to the face neighbours of the other kind
+        ! (as the wall force); output columns: i, j, k (global), wall area A, normal (3), and per scalar
+        ! the heat flow Q into the wall, Q/A and the interface temperature (average over the crossed faces);
+        ! qtot(1:nscal): global heat flow into the wall, qtot(nscal+1:2*nscal): that in the output cells;
+        ! clears wh_q
+        !
+        use mpi
+        integer , intent(in), dimension(3)          :: n,lo
+        integer , intent(in)                        :: nscal
+        logical , intent(in), dimension(0:,0:,0:)   :: mask_s
+        real(rp), intent(in), dimension(0:,0:,0:,:) :: cubeInput
+        real(rp), intent(out), dimension(:,:)       :: output
+        real(rp), intent(out), dimension(:)         :: qtot
+        real(rp) :: r(3*nscal),a_tot
+        logical  :: nbo(6)
+        integer  :: i,j,k,m,nc,ierr
+        qtot(:) = 0._rp
+        call wf_halo_add(n,wh_q)
+        do m=1,nscal ! total from the segments
+            qtot(m) = sum(wh_q(1:n(1),1:n(2),1:n(3),3*m-2))
+        end do
+        do k=1,n(3)
+            do j=1,n(2)
+                do i=1,n(1)
+                    if(.not.wf_cell(i,j,k) .or. cubeInput(i,j,k,10) > tiny(1._rp)) cycle
+                    nbo(:) = [mask_s(i+1,j,k),mask_s(i-1,j,k),mask_s(i,j+1,k),mask_s(i,j-1,k), &
+                              mask_s(i,j,k+1),mask_s(i,j,k-1)].neqv.mask_s(i,j,k)
+                    if(.not.any(nbo)) cycle
+                    r(:) = wh_q(i,j,k,:)/count(nbo)
+                    if(nbo(1)) wh_q(i+1,j,k,:) = wh_q(i+1,j,k,:) + r(:)
+                    if(nbo(2)) wh_q(i-1,j,k,:) = wh_q(i-1,j,k,:) + r(:)
+                    if(nbo(3)) wh_q(i,j+1,k,:) = wh_q(i,j+1,k,:) + r(:)
+                    if(nbo(4)) wh_q(i,j-1,k,:) = wh_q(i,j-1,k,:) + r(:)
+                    if(nbo(5)) wh_q(i,j,k+1,:) = wh_q(i,j,k+1,:) + r(:)
+                    if(nbo(6)) wh_q(i,j,k-1,:) = wh_q(i,j,k-1,:) + r(:)
+                    wh_q(i,j,k,:) = wh_q(i,j,k,:) - count(nbo)*r(:)
+                end do
+            end do
+        end do
+        call wf_halo_add(n,wh_q)
+        nc = 0
+        do k=1,n(3)
+            do j=1,n(2)
+                do i=1,n(1)
+                    a_tot = cubeInput(i,j,k,10)
+                    if(a_tot <= tiny(1._rp)) cycle
+                    nc = nc+1
+                    output(nc,1:3) = real([lo(1)+i-1,lo(2)+j-1,lo(3)+k-1],rp)
+                    output(nc,4)   = a_tot
+                    output(nc,5:7) = cubeInput(i,j,k,17:19)
+                    do m=1,nscal
+                        output(nc,7+3*m-2) = wh_q(i,j,k,3*m-2)
+                        output(nc,7+3*m-1) = wh_q(i,j,k,3*m-2)/a_tot
+                        output(nc,7+3*m  ) = 0._rp
+                        if(wh_q(i,j,k,3*m) > 0._rp) output(nc,7+3*m) = wh_q(i,j,k,3*m-1)/wh_q(i,j,k,3*m)
+                        qtot(nscal+m) = qtot(nscal+m) + wh_q(i,j,k,3*m-2)
+                    end do
+                end do
+            end do
+        end do
+        call MPI_ALLREDUCE(MPI_IN_PLACE,qtot,size(qtot),MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
+        wh_q(:,:,:,:) = 0._rp
+    end subroutine wall_heat_out
+    !
+    subroutine write_fv_rows(fname,output)
+        implicit none
+        character(len=*), intent(in)             :: fname
+        real(rp), dimension(:,:), intent(in)     :: output
+        integer                                  :: iunit,wr
+        character(len=*), parameter              :: fmt_dp = '(*(es24.16e3,1x))', &
+                                                    fmt_sp = '(*(es15.8e2,1x))'
+#if !defined(_SINGLE_PRECISION)
+        character(len=*), parameter              :: fmt_rp = fmt_dp
+#else
+        character(len=*), parameter              :: fmt_rp = fmt_sp
+#endif
+        open(newunit=iunit,file=fname,status='replace',action='write')
+        do wr=1,ubound(output,1)
+            write(iunit,fmt_rp) output(wr,:)
+        end do
+        close(iunit)
+    end subroutine write_fv_rows
     !
     subroutine out_ibm_wall_stress(fname,n,lo,ng,l,dl,pi_drive,imp_map)
         !
@@ -1985,6 +2257,211 @@ module mod_ibm
         close(iunit)
         end if
     end subroutine write_data
+    !
+    ! conjugate heat transfer: sub-cell geometry of the solid for the scalar (cell-centred) grid
+    !
+    subroutine set_cht_geometry(lo,n,l,dl,zc,dzc,dzf,mask_s,is_2nd,ibm_direction,amp_l,n_wave,l_0,phase_l,&
+                                hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap,thx,thy,thz,phi)
+        !
+        ! thx(i,j,k): fluid fraction of the segment between the centres of cells (i,j,k) and (i+1,j,k)
+        !             (thy, thz: along y and z); 1 inside the fluid, 0 inside the solid; for a segment
+        !             crossing the interface, the distance of the fluid cell centre to the interface
+        !             over the segment length: with the 2nd-order IBM (`is_2nd`) the interface is found
+        !             by bisection of `isInbody` along the segment; otherwise (staircase) it is placed
+        !             on the cell face, i.e. th = 1/2 (x, y) or dzf(k_fluid)/(2 dzc(k)) (z)
+        ! phi(i,j,k): fluid volume fraction of the cell: with the 2nd-order IBM, in the cells cut by the
+        !             interface, from the fluid length of `ns`**2 sub-columns along z (interface by bisection),
+        !             otherwise 0 (solid) or 1 (fluid)
+        !
+        implicit none
+        integer , intent(in), dimension(3)          :: lo,n
+        real(rp), intent(in), dimension(3)          :: l,dl
+        real(rp), intent(in), dimension(0:)         :: zc,dzc,dzf
+        logical , intent(in), dimension(0:,0:,0:)   :: mask_s
+        logical , intent(in)                        :: is_2nd
+        logical , intent(in), dimension(0:1,3)      :: ibm_direction
+        real(rp), intent(in), dimension(0:1,3)      :: amp_l
+        integer , intent(in), dimension(0:1,3)      :: n_wave
+        real(rp), intent(in), dimension(0:1,3)      :: l_0
+        real(rp), intent(in), dimension(0:1,3)      :: phase_l
+        real(rp),intent(in),optional                :: hmap(0:,0:)
+        integer,intent(in),optional                 :: n1_hmap,n2_hmap
+        real(rp),intent(in),optional                :: l1_hmap,l2_hmap
+        real(rp), intent(out), dimension(0:,0:,0:)  :: thx,thy,thz,phi
+        integer, parameter :: ns = 10 ! sub-columns per direction (x, y) for the volume fraction
+        integer  :: i,j,k,ii,jj,kk,a,b,c,ncut
+        real(rp) :: x,y,z,xn,yn,zn,lint,zlo,zhi,xs,ys,fsum
+        logical  :: ms,mn,mc,slo,shi
+        ncut = 0
+        do k=0,n(3)+1
+            do j=0,n(2)+1
+                do i=0,n(1)+1
+                    ii = lo(1)+i-1
+                    jj = lo(2)+j-1
+                    x = (real(ii,rp)-0.5_rp)*dl(1)
+                    y = (real(jj,rp)-0.5_rp)*dl(2)
+                    z = zc(k)
+                    ms = mask_s(i,j,k)
+                    !
+                    ! face fractions (the last cell along each direction has no neighbour: uniform)
+                    !
+                    thx(i,j,k) = merge(0._rp,1._rp,ms)
+                    thy(i,j,k) = merge(0._rp,1._rp,ms)
+                    thz(i,j,k) = merge(0._rp,1._rp,ms)
+                    if(i <= n(1)) then
+                        mn = mask_s(i+1,j,k)
+                        if(ms.neqv.mn) then
+                            if(is_2nd) then
+                                xn = x+dl(1)
+                                if(ms) then
+                                    lint = interface_pos(1,x,y,z,xn,x,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,&
+                                                         hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap)
+                                    thx(i,j,k) = abs(lint-xn)/dl(1)
+                                else
+                                    lint = interface_pos(1,x,y,z,x,xn,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,&
+                                                         hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap)
+                                    thx(i,j,k) = abs(lint-x)/dl(1)
+                                endif
+                            else
+                                thx(i,j,k) = 0.5_rp
+                            endif
+                        endif
+                    endif
+                    if(j <= n(2)) then
+                        mn = mask_s(i,j+1,k)
+                        if(ms.neqv.mn) then
+                            if(is_2nd) then
+                                yn = y+dl(2)
+                                if(ms) then
+                                    lint = interface_pos(2,x,y,z,yn,y,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,&
+                                                         hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap)
+                                    thy(i,j,k) = abs(lint-yn)/dl(2)
+                                else
+                                    lint = interface_pos(2,x,y,z,y,yn,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,&
+                                                         hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap)
+                                    thy(i,j,k) = abs(lint-y)/dl(2)
+                                endif
+                            else
+                                thy(i,j,k) = 0.5_rp
+                            endif
+                        endif
+                    endif
+                    if(k <= n(3)) then
+                        mn = mask_s(i,j,k+1)
+                        if(ms.neqv.mn) then
+                            zn = zc(k+1)
+                            if(is_2nd) then
+                                if(ms) then
+                                    lint = interface_pos(3,x,y,z,zn,z,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,&
+                                                         hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap)
+                                    thz(i,j,k) = abs(lint-zn)/dzc(k)
+                                else
+                                    lint = interface_pos(3,x,y,z,z,zn,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,&
+                                                         hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap)
+                                    thz(i,j,k) = abs(lint-z)/dzc(k)
+                                endif
+                            else
+                                if(ms) then
+                                    thz(i,j,k) = 0.5_rp*dzf(k+1)/dzc(k)
+                                else
+                                    thz(i,j,k) = 0.5_rp*dzf(k  )/dzc(k)
+                                endif
+                            endif
+                        endif
+                    endif
+                    !
+                    ! fluid volume fraction
+                    !
+                    phi(i,j,k) = merge(0._rp,1._rp,ms)
+                    if(is_2nd) then
+                        zlo = z-0.5_rp*dzf(k); zhi = z+0.5_rp*dzf(k)
+                        mc = .false.
+                        do c=0,1
+                            do b=0,1
+                                do a=0,1
+                                    if(isInbody(ibm_direction,amp_l,n_wave,l_0,phase_l,x+(a-0.5_rp)*dl(1),y+(b-0.5_rp)*dl(2),&
+                                                merge(zhi,zlo,c == 1),n,l,hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap).neqv.ms) mc = .true.
+                                end do
+                            end do
+                        end do
+                        if(mc) then
+                            !
+                            ! fluid length of each of the ns x ns sub-columns along z: by bisection of the
+                            ! interface when the column ends differ (exact for walls given as heights
+                            ! z_w(x,y), i.e. at most one crossing per column within a cell), otherwise
+                            ! the column is entirely fluid or solid
+                            !
+                            ncut = ncut+1
+                            fsum = 0._rp
+                            do b=1,ns
+                                do a=1,ns
+                                    xs = x+((a-0.5_rp)/ns-0.5_rp)*dl(1)
+                                    ys = y+((b-0.5_rp)/ns-0.5_rp)*dl(2)
+                                    slo = isInbody(ibm_direction,amp_l,n_wave,l_0,phase_l,xs,ys,zlo,n,l,hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap)
+                                    shi = isInbody(ibm_direction,amp_l,n_wave,l_0,phase_l,xs,ys,zhi,n,l,hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap)
+                                    if(slo.eqv.shi) then
+                                        if(.not.slo) fsum = fsum+1._rp
+                                    else
+                                        if(slo) then
+                                            lint = interface_pos(3,xs,ys,z,zhi,zlo,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,&
+                                                                 hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap)
+                                            fsum = fsum+(zhi-lint)/dzf(k)
+                                        else
+                                            lint = interface_pos(3,xs,ys,z,zlo,zhi,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,&
+                                                                 hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap)
+                                            fsum = fsum+(lint-zlo)/dzf(k)
+                                        endif
+                                    endif
+                                end do
+                            end do
+                            phi(i,j,k) = fsum/real(ns**2,rp)
+                        endif
+                    endif
+                end do
+            end do
+        end do
+        if(is_2nd) print*, "CHT geometry: cells cut by the interface (incl. ghost cells): ", ncut
+    end subroutine set_cht_geometry
+    !
+    function interface_pos(dir,x,y,z,lf,ls,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,&
+                           hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap) result(lint)
+        !
+        ! position of the interface along direction `dir` through (x,y,z), by bisection between the
+        ! coordinate `lf` (in the fluid) and `ls` (in the solid)
+        !
+        implicit none
+        integer , intent(in)                        :: dir
+        real(rp), intent(in)                        :: x,y,z,lf,ls
+        logical , intent(in), dimension(0:1,3)      :: ibm_direction
+        real(rp), intent(in), dimension(0:1,3)      :: amp_l
+        integer , intent(in), dimension(0:1,3)      :: n_wave
+        real(rp), intent(in), dimension(0:1,3)      :: l_0
+        real(rp), intent(in), dimension(0:1,3)      :: phase_l
+        integer , intent(in), dimension(3)          :: n
+        real(rp), intent(in), dimension(3)          :: l
+        real(rp),intent(in),optional                :: hmap(0:,0:)
+        integer,intent(in),optional                 :: n1_hmap,n2_hmap
+        real(rp),intent(in),optional                :: l1_hmap,l2_hmap
+        real(rp) :: lint,lfl,lso,xx,yy,zz
+        integer  :: it
+        lfl = lf; lso = ls
+        do it=1,60
+            lint = 0.5_rp*(lfl+lso)
+            xx = x; yy = y; zz = z
+            select case(dir)
+            case(1); xx = lint
+            case(2); yy = lint
+            case(3); zz = lint
+            end select
+            if(isInbody(ibm_direction,amp_l,n_wave,l_0,phase_l,xx,yy,zz,n,l,hmap,l1_hmap,l2_hmap,n1_hmap,n2_hmap)) then
+                lso = lint
+            else
+                lfl = lint
+            endif
+        end do
+        lint = 0.5_rp*(lfl+lso)
+    end function interface_pos
+    !
     subroutine apply_ibm_staircase(field,mask_id,dt)
         implicit none
         real(rp),intent(inout),dimension(0:,0:,0:)  :: field
@@ -2007,7 +2484,7 @@ module mod_ibm
         implicit none
         real(rp),intent(inout),dimension(0:,0:,0:)  :: scalar_field
         logical,intent(in),dimension(0:,0:,0:)      :: scalar_mask_id
-        real(rp),intent(in)                         :: scalar_bc
+        real(rp),intent(in),dimension(0:)           :: scalar_bc ! per level k
         integer :: i,j,k
         !$acc parallel loop collapse(3) default(present) async(1)
         !$OMP parallel do   collapse(3) DEFAULT(shared)
@@ -2015,7 +2492,7 @@ module mod_ibm
             do j = lbound(scalar_field,2)+1,ubound(scalar_field,2)-1
                 do i = lbound(scalar_field,1)+1,ubound(scalar_field,1)-1
                     if (scalar_mask_id(i,j,k).eqv..true.)then
-                        scalar_field(i,j,k) = scalar_bc 
+                        scalar_field(i,j,k) = scalar_bc(k)
                     endif
                 end do 
             end do 

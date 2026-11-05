@@ -99,7 +99,7 @@ module mod_solve_helmholtz
     character(len=1), intent(in), dimension(3)              :: c_or_f
     logical ,    intent(in   ), dimension(0:,0:,0:)         :: mask
     real(rp),    intent(in   ), dimension(0:,0:,0:)         :: am
-    real(rp),    intent(in   )                              :: sw
+    real(rp),    intent(in   ), dimension(0:)               :: sw ! wall value per level k
     logical ,    intent(in   )                              :: is_set_solid
     real(rp),    intent(inout), dimension(0:,0:,0:)         :: p
     real(rp), allocatable, dimension(:,:,:), save :: d
@@ -132,7 +132,7 @@ module mod_solve_helmholtz
         !$acc loop seq
         do k=1,n(3)
           if(mask(i,j,k)) then
-            rhs = ibm_pen*sw
+            rhs = ibm_pen*sw(k)
           else
             rhs = am(i,j,k)*p(i,j,k)
           end if
@@ -151,16 +151,16 @@ module mod_solve_helmholtz
             p(i,j,k) = pm
           else
             p(i,j,k) = rhs ! boundary face, not solved
-            if(is_set_solid .and. mask(i,j,k)) p(i,j,k) = sw
+            if(is_set_solid .and. mask(i,j,k)) p(i,j,k) = sw(k)
           end if
         end do
         pk = p(i,j,nn)
-        if(is_set_solid .and. mask(i,j,nn)) p(i,j,nn) = sw
+        if(is_set_solid .and. mask(i,j,nn)) p(i,j,nn) = sw(nn)
         !$acc loop seq
         do k=nn-1,1,-1
           pk = p(i,j,k) - d(i,j,k)*pk
           p(i,j,k) = pk
-          if(is_set_solid .and. mask(i,j,k)) p(i,j,k) = sw
+          if(is_set_solid .and. mask(i,j,k)) p(i,j,k) = sw(k)
         end do
       end do
     end do

@@ -56,11 +56,12 @@ program cans
                                  nstep,time_max,tw_max,stop_type, &
                                  restart,is_overwrite_save,nsaves_max, &
                                  icheck,iout0d,iout1d,iout2d,iout3d,isave, &
+                                 iaverage,average_start_time, &
                                  cbcvel,bcvel,cbcpre,bcpre, &
                                  is_forced,bforce,velf, &
                                  gacc,nscal,beta, &
                                  alphai,iniscal,cbcscal,bcscal,&
-                                 cbcscal_ibm,bcscal_ibm,&
+                                 cbcscal_ibm,bcscal_ibm,bcscal_ibm_top,&
                                  ssource,is_sforced,scalf,scal_mean_grad,&
                                  is_boussinesq_buoyancy,&
                                  dims, &
@@ -83,12 +84,17 @@ program cans
                                  bulk_vel_def,     &
                                  ibm_proj,ibm_iout_wall, &
                                  ibm_hch,          &
+                                 geometry,sdf_file,dump_ibm_geometry, &
                                  use_hmap,         &
                                  override_grid,     &
                                  hmap_name          
   use mod_sanity         , only: test_sanity_input,test_sanity_solver
   use mod_scal           , only: scalar,initialize_scalars,bulk_forcing_s
+  use mod_stats3d        , only: stats3d_init,stats3d_update,stats3d_save
   use mod_solve_helmholtz, only: solve_helmholtz,solve_helmholtz_ibm,rhs_bound
+  use mod_cht            , only: cht_init
+  use mod_ibm_sdf        , only: sdf_read,sdf_staggered,sdf_mask,set_ibm_2nd_sdf,calc_grad_dist_sdf, &
+                                 set_cht_geometry_sdf
 #if !defined(_OPENACC)
   use mod_solver         , only: solver
 #else
@@ -161,6 +167,8 @@ program cans
   logical  :: is_intrinsic
   real(rp), allocatable, dimension(:) :: fs
   integer :: iscal,is,nscalibm
+  real(rp), allocatable, dimension(:,:) :: swz ! IB wall value of each scalar per local level k: bcscal_ibm_top above the mid-plane
+  real(rp), allocatable, dimension(:)   :: swz0 ! zero wall value (velocity)
   !
   !real(rp), allocatable, dimension(:) :: var
   real(rp), dimension(42) :: var
@@ -222,10 +230,22 @@ program cans
   real(rp),allocatable :: frifv(:,:,:,:),frifvout(:,:)
   character (len=7)   :: mpiranknum 
   real(rp) :: dtrk_last = 0._rp,p_wf,pp_wf,fac_wf ! exact wall force per cell: previous stage's dt_rk, pressure levels
+  logical  :: is_wall_heat = .false.,is_per(3)
+  real(rp), allocatable :: frhout(:,:),qwall(:),ze_sdf(:) ! wall heat flux per cell; level-set z coordinates
   real(rp) :: ibm_idx_off(12)
 !*******HMAP********!,
   !for init grid
   real(rp)  :: hmax_g,hch_g,hmin_g
+!******************!
+!*******CHT*********!
+  ! sub-cell geometry of the solid for the scalars with conjugate heat transfer (see `set_cht_geometry`)
+  real(rp), allocatable, dimension(:,:,:) :: thx,thy,thz,phi_cht
+  logical  :: is_cht_any
+  real(rp) :: alpha_max_eff
+  ! level-set geometry (`geometry = 'sdf'`): level set at the cell centres (two halo layers) and at the
+  ! cell centres/velocity positions (one halo layer)
+  logical  :: is_sdf
+  real(rp), allocatable, dimension(:,:,:) :: ps_sdf,phi_s_sdf,phi_u_sdf,phi_v_sdf,phi_w_sdf
 !******************!
   !
   call MPI_INIT(ierr)
@@ -235,6 +255,7 @@ program cans
   ! read parameter file
   !
   call read_input(myid)
+  iout_wall = merge(iout1d,ibm_iout_wall,ibm_iout_wall < 0)
   !
   ! initialize MPI/OpenMP
   !
@@ -305,6 +326,15 @@ program cans
   call initialize_scalars(scalars,nscal,n,n_z)
   allocate(fs(nscal))
   !$acc enter data copyin(scalars(:))
+  is_cht_any = .false.
+  if(nscal > 0) is_cht_any = any(scalars(:)%is_cht)
+  is_sdf = trim(geometry) == 'sdf'
+  !
+  ! largest scalar diffusivity for the time step limit of explicit diffusion
+  ! (inside the solid of CHT scalars: conductivity over heat capacity)
+  !
+  alpha_max_eff = alpha_max
+  if(nscal > 0 .and. .not.is_impdiff) alpha_max_eff = max(alpha_max,maxval(scalars(:)%alpha_max))
   !
   if(use_hmap)then
     call read_thakkar_nfo(myid)
@@ -400,6 +430,15 @@ program cans
     grid_vol_ratio_f(k) = dl(1)*dl(2)*dzf(k)/(l(1)*l(2)*l(3))
   end do
   !$acc update self(zc,zf,dzc,dzf,dzci,dzfi) async
+  !$acc wait
+  allocate(swz(0:n(3)+1,max(nscal,1)),swz0(0:n(3)+1))
+  swz(:,:) = 0._rp; swz0(:) = 0._rp
+  do is=1,nscal
+    do k=0,n(3)+1
+      swz(k,is) = merge(bcscal_ibm_top(is),bcscal_ibm(is),zc(k) > zf_g(0)+l(3)/2) ! above the domain mid-plane
+    end do
+  end do
+  !$acc enter data copyin(swz,swz0) async
   !$acc exit data copyout(zc_g,zf_g,dzc_g,dzf_g,dzci_g,dzfi_g) async ! not needed on the device
   !$acc wait
   !
@@ -511,7 +550,11 @@ program cans
   end do
   !$acc wait
   !
-  call chkdt(n,dl,dzci,dzfi,visc,alpha_max,u,v,w,dt_cfl)
+  ! 3D time averages
+  !
+  if(iaverage > 0) call stats3d_init(n,nscal,restart,trim(datadir),ng,lo,hi,myid)
+  !
+  call chkdt(n,dl,dzci,dzfi,visc,alpha_max_eff,u,v,w,dt_cfl)
   dt = merge(dt_f,min(cfl*dt_cfl,dtmax),dt_f > 0.)
   if(myid == 0) print*, 'dt_cfl = ', dt_cfl, 'dt = ', dt
   dti = 1./dt
@@ -576,7 +619,24 @@ program cans
   !$acc enter data copyin(A_u,A_v,A_w,A_s,B_u,B_v,B_w,B_s)
 #endif  
   
-  if(is_ibm)then
+  if(is_ibm .and. is_sdf)then
+    !
+    ! level-set geometry: masks from the sign of the level set at the respective positions
+    !
+    if(myid == 0) print*, '*** IBM geometry from the level set `'//trim(sdf_file)//'` ***'
+    allocate(ps_sdf(-1:n(1)+2,-1:n(2)+2,-1:n(3)+2))
+    allocate(phi_s_sdf(0:n(1)+1,0:n(2)+1,0:n(3)+1),phi_u_sdf(0:n(1)+1,0:n(2)+1,0:n(3)+1), &
+             phi_v_sdf(0:n(1)+1,0:n(2)+1,0:n(3)+1),phi_w_sdf(0:n(1)+1,0:n(2)+1,0:n(3)+1))
+    call sdf_read(sdf_file,ng,lo,n,zc,ps_sdf)
+    call sdf_staggered(n,dzc,dzf,ps_sdf,phi_s_sdf,phi_u_sdf,phi_v_sdf,phi_w_sdf)
+    call sdf_mask(phi_u_sdf,mask_u)
+    call sdf_mask(phi_v_sdf,mask_v)
+    call sdf_mask(phi_w_sdf,mask_w)
+    call sdf_mask(phi_s_sdf,mask_s)
+#if defined (_OPENACC)
+    !$acc enter data copyin(mask_u,mask_v,mask_w,mask_s)
+#endif
+  else if(is_ibm)then
     ! we fill the ibm masks here
     print*, "***IBM masks are deploying***"
     call set_ibm_staircase(lo,mask_u,1,0,0,n,l,dl,&
@@ -590,11 +650,20 @@ program cans
 #if defined (_OPENACC)
     !$acc enter data copyin(mask_u,mask_v,mask_w,mask_s)
 #endif
+  endif
+  if(is_ibm)then
+    ! column-integrated IB force, also needed by the IB force output (`iout0d`) with `geometry = 'sdf'`
     allocate(imp_map(n(1),n(2),2))
     !$acc enter data create(imp_map)
   endif
   if(is_ibm)then
     print*, "***IBM coefficients are deploying***"
+    if(is_sdf)then
+    call set_ibm_2nd_sdf(n,dl,dzc,dzf,0,phi_u_sdf,mask_u,lap_u,band_u)
+    call set_ibm_2nd_sdf(n,dl,dzc,dzf,0,phi_v_sdf,mask_v,lap_v,band_v)
+    call set_ibm_2nd_sdf(n,dl,dzc,dzf,1,phi_w_sdf,mask_w,lap_w,band_w)
+    call set_ibm_2nd_sdf(n,dl,dzc,dzf,0,phi_s_sdf,mask_s,lap_s,band_s)
+    else
     call set_ibm_2nd(lo,mask_u,lap_u,1,0,0&
         ,n,l,dl,ibm_direction,amp_l,n_wave,l_0,phase_l,hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha,zc,zf,dzc,dzf,use_hmap,band_u)
     call set_ibm_2nd(lo,mask_v,lap_v,0,1,0&
@@ -603,11 +672,11 @@ program cans
         ,n,l,dl,ibm_direction,amp_l,n_wave,l_0,phase_l,hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha,zc,zf,dzc,dzf,use_hmap,band_w)
     call set_ibm_2nd(lo,mask_s,lap_s,0,0,0,n,l,dl,ibm_direction,amp_l,n_wave,l_0,phase_l,&
                             hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha,zc,zf,dzc,dzf,use_hmap,band_s)
+    endif
     call set_ibm_band(lap_u,idx_u,lapb_u)
     call set_ibm_band(lap_v,idx_v,lapb_v)
     call set_ibm_band(lap_w,idx_w,lapb_w)
     call set_ibm_band(lap_s,idx_s,lapb_s)
-    deallocate(lap_u,lap_v,lap_w,lap_s)
     !$acc enter data copyin(idx_u,idx_v,idx_w,idx_s,lapb_u,lapb_v,lapb_w,lapb_s)
   endif
   if(is_ibm)then
@@ -634,28 +703,56 @@ program cans
         displ_s(ibm_i)=displ_s(ibm_i-1)+sca_ga(ibm_i-1)
       end do
     endif
-    
-
-    iout_wall = merge(iout1d,ibm_iout_wall,ibm_iout_wall < 0)
-    if(iout_wall > 0) then ! set-up of the per-point wall outputs
-      call calc_grad_dist(fri_u,lo,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,dl,zc,zf,&
-                                  band_u,1,0,0,hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha,dzf,dzc)
-      call calc_grad_dist(fri_v,lo,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,dl,zc,zf,&
-                                  band_v,0,1,0,hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha,dzf,dzc)
-      call calc_grad_dist(fri_w,lo,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,dl,zc,zf,&
-                                  band_w,0,0,1,hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha,dzf,dzc)
-      call calc_grad_dist(p_grad,lo,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,dl,zc,zf,&
-                                  band_s,0,0,0,hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha,dzf,dzc)                    
-      !
+    !
+    ! set-up of the per-point wall outputs (every `iout_wall` steps; none with ibm_iout_wall = 0)
+    !
+    if(iout_wall > 0) then
+    if(is_sdf)then
+    call calc_grad_dist_sdf(fri_u ,lo,n,dl,zc,zf,band_u,1,0,0,phi_u_sdf)
+    call calc_grad_dist_sdf(fri_v ,lo,n,dl,zc,zf,band_v,0,1,0,phi_v_sdf)
+    call calc_grad_dist_sdf(fri_w ,lo,n,dl,zc,zf,band_w,0,0,1,phi_w_sdf)
+    call calc_grad_dist_sdf(p_grad,lo,n,dl,zc,zf,band_s,0,0,0,phi_s_sdf)
+    else
+    call calc_grad_dist(fri_u,lo,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,dl,zc,zf,&
+                                band_u,1,0,0,hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha,dzf,dzc)
+    call calc_grad_dist(fri_v,lo,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,dl,zc,zf,&
+                                band_v,0,1,0,hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha,dzf,dzc)
+    call calc_grad_dist(fri_w,lo,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,dl,zc,zf,&
+                                band_w,0,0,1,hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha,dzf,dzc)
+    call calc_grad_dist(p_grad,lo,ibm_direction,amp_l,n_wave,l_0,phase_l,n,l,dl,zc,zf,&
+                                band_s,0,0,0,hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha,dzf,dzc)                    
+    endif
+    endif
+    !
+    ! exact wall force and wall heat flux per cell (`FV-fric_*`, `FV-heat_*`): with the level-set
+    ! geometry, the wall points and the sub-cell geometry come from the level set (ps_sdf, ze_sdf)
+    !
+    allocate(frifv(0:n(1),0:n(2),0:n(3),19))
+    frifv(:,:,:,:) = 0._rp
+    if(iout_wall > 0) then
+    if(.not.is_sdf)then
+    call init_wall_force(n,lo,l,dl,zc,zf,dzc,dzf,mask_u,mask_v,mask_w,mask_s,ibm_direction,amp_l,n_wave,l_0,phase_l, &
+                         hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha)
+    call init_fric_cubes(wf_cell,mask_s,lo,dl,zc,zf,dzc,&
+                                        dzf,xf_g,yc_g,0,0,0,ibm_direction,amp_l,&
+                                        n_wave,l_0,phase_l,n,l,hmap_tha,lx_tha,ly_tha,&
+                                        nx_hmap_tha,ny_hmap_tha,frifv)
+    else
+      allocate(ze_sdf(-1:n(3)+2))
+      ze_sdf(0:n(3)+1) = zc(0:n(3)+1)
+      ze_sdf(-1) = 2._rp*ze_sdf(0)-ze_sdf(1)
+      ze_sdf(n(3)+2) = 2._rp*ze_sdf(n(3)+1)-ze_sdf(n(3))
       call init_wall_force(n,lo,l,dl,zc,zf,dzc,dzf,mask_u,mask_v,mask_w,mask_s,ibm_direction,amp_l,n_wave,l_0,phase_l, &
-                           hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha)
-      allocate(frifv(0:n(1),0:n(2),0:n(3),19))
+                           ps=ps_sdf,ze=ze_sdf)
       call init_fric_cubes(wf_cell,mask_s,lo,dl,zc,zf,dzc,&
                                           dzf,xf_g,yc_g,0,0,0,ibm_direction,amp_l,&
-                                          n_wave,l_0,phase_l,n,l,hmap_tha,lx_tha,ly_tha,&
-                                          nx_hmap_tha,ny_hmap_tha,frifv)
-      allocate(frifvout(count(frifv(1:n(1),1:n(2),1:n(3),10)>tiny(1._rp)),26))
-    end if
+                                          n_wave,l_0,phase_l,n,l,output=frifv,ps=ps_sdf,ze=ze_sdf)
+    endif
+    endif
+    allocate(frifvout(count(frifv(1:n(1),1:n(2),1:n(3),10)>tiny(1._rp)),26))
+    allocate(frhout(size(frifvout,1),7+3*nscal),qwall(2*nscal))
+    is_wall_heat = nscal > 0 .and. iout_wall > 0
+    is_per(:) = cbcpre(0,:)//cbcpre(1,:) == 'PP'
     !
 #if defined (_OPENACC)
     !$acc enter data copyin(fri_u,fri_v,fri_w,p_grad)
@@ -686,6 +783,45 @@ program cans
       end if
     end block
   endif
+  !
+  ! conjugate heat transfer: sub-cell geometry of the solid (interface position along the cell
+  ! centre-to-centre segments and fluid volume fractions, exact with the 2nd-order IBM, on the cell
+  ! faces with the staircase IBM) and the implicit diffusion solver
+  !
+  if(is_cht_any .or. (is_ibm .and. is_wall_heat))then ! also for the wall heat flux of scalars without CHT
+    allocate(thx(0:n(1)+1,0:n(2)+1,0:n(3)+1), &
+             thy(0:n(1)+1,0:n(2)+1,0:n(3)+1), &
+             thz(0:n(1)+1,0:n(2)+1,0:n(3)+1), &
+             phi_cht(0:n(1)+1,0:n(2)+1,0:n(3)+1))
+    if(is_sdf)then
+      call set_cht_geometry_sdf(n,dl,zc,dzc,dzf,ps_sdf,.true.,thx,thy,thz,phi_cht)
+    else
+      call set_cht_geometry(lo,n,l,dl,zc,dzc,dzf,mask_s,.true.,ibm_direction,amp_l,n_wave,l_0,phase_l,&
+                            hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha,thx,thy,thz,phi_cht)
+    endif
+    !$acc enter data copyin(thx,thy,thz,phi_cht)
+    if(is_cht_any) then
+    call cht_init(n,ng,l,dzci_g,dzfi_g,thx,thy,thz,phi_cht,scalars)
+    if(myid == 0) print*, '*** CHT geometry set up ***'
+    end if
+  endif
+  !
+  ! optional output of the IBM/CHT geometry fields (interior cells, x fastest, serial runs only)
+  !
+  if(dump_ibm_geometry .and. is_ibm)then
+    if(np_mpi == 1)then
+      open(newunit=iunit,file=trim(datadir)//'ibm_geometry.bin',access='stream',form='unformatted',status='replace')
+      write(iunit) lap_u(1:n(1),1:n(2),1:n(3)),lap_v(1:n(1),1:n(2),1:n(3)), &
+                   lap_w(1:n(1),1:n(2),1:n(3)),lap_s(1:n(1),1:n(2),1:n(3))
+      if(is_cht_any) write(iunit) thx(1:n(1),1:n(2),1:n(3)),thy(1:n(1),1:n(2),1:n(3)), &
+                                  thz(1:n(1),1:n(2),1:n(3)),phi_cht(1:n(1),1:n(2),1:n(3))
+      close(iunit)
+      if(myid == 0) print*, '*** IBM geometry written to data/ibm_geometry.bin (lap_u,v,w,s; thx,y,z,phi) ***'
+    else
+      if(myid == 0) print*, 'Warning: `dump_ibm_geometry` is only supported for serial runs.'
+    endif
+  endif
+  if(is_ibm) deallocate(lap_u,lap_v,lap_w,lap_s) ! only the band list (`set_ibm_band`) is kept
 !********IBM-END*************!
   ! post-process and write initial condition
   !
@@ -704,38 +840,38 @@ program cans
                           mask_u,mask_v,mask_w,mask_s)
   end if
   if(is_ibm.and.iout_wall > 0.and.mod(istep,max(iout_wall,1)) == 0) then
-    call calc_shear_st(fri_u,u,visc)
-    call calc_shear_st(fri_v,v,visc)
-    call calc_shear_st(fri_w,w,visc)
-    call get_wall_pres(p,p_grad,lo,dl,zc,zf,mask_s,band_s)
-    if(myid==0)then
-      globu=>fri_u_g
-      globv=>fri_v_g
-      globw=>fri_w_g
-      globp=>p_grad_g
-    else
-      globu=>dum_g
-      globv=>dum_g
-      globw=>dum_g
-      globp=>dum_g
-    endif
-    !$acc update self(fri_u,fri_v,fri_w,p_grad)
-    do ibm_i=1,12
-      call MPI_GATHERV(fri_u(:,ibm_i)+ibm_idx_off(ibm_i),&
-                       size_u,MPI_REAL_RP,globu(:,ibm_i),fri_u_ga,displ_u,MPI_REAL_RP,0,MPI_COMM_WORLD,ierr)
-      call MPI_GATHERV(fri_v(:,ibm_i)+ibm_idx_off(ibm_i),&
-                       size_v,MPI_REAL_RP,globv(:,ibm_i),fri_v_ga,displ_v,MPI_REAL_RP,0,MPI_COMM_WORLD,ierr)
-      call MPI_GATHERV(fri_w(:,ibm_i)+ibm_idx_off(ibm_i),&
-                       size_w,MPI_REAL_RP,globw(:,ibm_i),fri_w_ga,displ_w,MPI_REAL_RP,0,MPI_COMM_WORLD,ierr)
-      call MPI_GATHERV(p_grad(:,ibm_i)+ibm_idx_off(ibm_i),&
-                       size_s,MPI_REAL_RP,globp(:,ibm_i),sca_ga,displ_s,MPI_REAL_RP,0,MPI_COMM_WORLD,ierr)
-    end do
-    if(myid==0)then
-      call write_data(trim(datadir)//"fric-u_"//fldnum//".out",myid,fri_u_g)
-      call write_data(trim(datadir)//"fric-v_"//fldnum//".out",myid,fri_v_g)
-      call write_data(trim(datadir)//"fric-w_"//fldnum//".out",myid,fri_w_g)
-      call write_data(trim(datadir)//"pressure"//fldnum//".out",myid,p_grad_g)
-    endif
+      call calc_shear_st(fri_u,u,visc)
+      call calc_shear_st(fri_v,v,visc)
+      call calc_shear_st(fri_w,w,visc)
+      call get_wall_pres(p,p_grad,lo,dl,zc,zf,mask_s,band_s)
+      if(myid==0)then
+        globu=>fri_u_g
+        globv=>fri_v_g
+        globw=>fri_w_g
+        globp=>p_grad_g
+      else
+        globu=>dum_g
+        globv=>dum_g
+        globw=>dum_g
+        globp=>dum_g
+      endif
+      !$acc update self(fri_u,fri_v,fri_w,p_grad)
+      do ibm_i=1,12
+        call MPI_GATHERV(fri_u(:,ibm_i)+ibm_idx_off(ibm_i),&
+                         size_u,MPI_REAL_RP,globu(:,ibm_i),fri_u_ga,displ_u,MPI_REAL_RP,0,MPI_COMM_WORLD,ierr)
+        call MPI_GATHERV(fri_v(:,ibm_i)+ibm_idx_off(ibm_i),&
+                         size_v,MPI_REAL_RP,globv(:,ibm_i),fri_v_ga,displ_v,MPI_REAL_RP,0,MPI_COMM_WORLD,ierr)
+        call MPI_GATHERV(fri_w(:,ibm_i)+ibm_idx_off(ibm_i),&
+                         size_w,MPI_REAL_RP,globw(:,ibm_i),fri_w_ga,displ_w,MPI_REAL_RP,0,MPI_COMM_WORLD,ierr)
+        call MPI_GATHERV(p_grad(:,ibm_i)+ibm_idx_off(ibm_i),&
+                         size_s,MPI_REAL_RP,globp(:,ibm_i),sca_ga,displ_s,MPI_REAL_RP,0,MPI_COMM_WORLD,ierr)
+      end do
+      if(myid==0)then
+        call write_data(trim(datadir)//"fric-u_"//fldnum//".out",myid,fri_u_g)
+        call write_data(trim(datadir)//"fric-v_"//fldnum//".out",myid,fri_v_g)
+        call write_data(trim(datadir)//"fric-w_"//fldnum//".out",myid,fri_w_g)
+        call write_data(trim(datadir)//"pressure"//fldnum//".out",myid,p_grad_g)
+      endif
   end if
   if(iout2d > 0.and.mod(istep,max(iout2d,1)) == 0) then
     include 'out2d.h90'
@@ -807,8 +943,9 @@ program cans
         end if
         if(is_first_stage) then
           do nscalibm=1,nscal
+            if(scalars(nscalibm)%is_cht) cycle ! CHT: the scalar is solved inside the solid
             call apply_ibm_staircase_scalar(scalars(nscalibm)%val,&
-                mask_s,bcscal_ibm(nscalibm))
+                mask_s,swz(:,nscalibm))
           end do
         end if
         call timer_toc('ibm_stage_start',nvtx_gpu_stream=-1)
@@ -847,6 +984,16 @@ program cans
       !*******************!
       do iscal=1,nscal
         s => scalars(iscal)
+        if(s%is_cht) then
+          !
+          ! conjugate heat transfer: no wall condition at the interface (A_s/B_s and the wall value unused)
+          !
+          call rk_scal(rkcoeff(:,irk),n,dli,l,dzci,dzfi,grid_vol_ratio_f,s%alpha,dt,is_bound,u,v,w, &
+                       s%is_forced,s%scalf,s%source,s%fluxo,s%dsdtrko,s%val,s%f,A_s,B_s, &
+                       swz(:,iscal),scal_mean_grad(iscal),mask_s, &
+                       is_cht=s%is_cht,alphas=s%alphas,cs_cf=s%cs_cf,cbcz=s%cbc(:,3), &
+                       thx=thx,thy=thy,thz=thz,phi=phi_cht)
+        else
         if(is_ibm) then
           call timer_tic('ibm_calc_a_b',nvtx_color='r',nvtx_gpu_stream=-1)
           call calc_a_b(idx_s,lapb_s,A_s,B_s,dtrk,s%alpha) ! A_s, B_s depend on the diffusivity
@@ -854,17 +1001,18 @@ program cans
         end if
         call rk_scal(rkcoeff(:,irk),n,dli,l,dzci,dzfi,grid_vol_ratio_f,s%alpha,dt,is_bound,u,v,w, &
                      s%is_forced,s%scalf,s%source,s%fluxo,s%dsdtrko,s%val,s%f,A_s,B_s, &
-                     bcscal_ibm(iscal),scal_mean_grad(iscal),mask_s)
+                     swz(:,iscal),scal_mean_grad(iscal),mask_s)
+        end if
         if(is_ibm) then
           if(s%is_forced) call bulk_forcing_ibm(n,mask_s,A_s,s%f,s%val)
         else
           call bulk_forcing_s(n,s%is_forced,s%f,s%val)
         end if
         fs(iscal) = fs(iscal) + s%f
-        if(is_impdiff) then
+        if(is_impdiff .and. .not.s%is_cht) then ! CHT: diffusion already treated implicitly in `rk_scal`
           if(is_ibm .and. is_impdiff_1d) then
             call solve_helmholtz_ibm(n,-0.5*s%alpha*dtrk,s%a,s%b,s%c,s%rhsb%x,s%rhsb%y,s%rhsb%z,is_bound, &
-                                     s%cbc,['c','c','c'],mask_s,A_s,bcscal_ibm(iscal),.false.,s%val)
+                                     s%cbc,['c','c','c'],mask_s,A_s,swz(:,iscal),.false.,s%val)
           else
             call solve_helmholtz(n,ng,hi,s%arrplan,s%normfft,-0.5*s%alpha*dtrk, &
                                  s%lambdaxy,s%a,s%b,s%c,s%rhsb%x,s%rhsb%y,s%rhsb%z,is_bound,s%cbc,['c','c','c'],s%val)
@@ -912,11 +1060,11 @@ program cans
         alpha = -.5*visc*dtrk
         if(is_ibm .and. is_impdiff_1d) then
           call solve_helmholtz_ibm(n,alpha,au,bu,cu,rhsbu%x,rhsbu%y,rhsbu%z,is_bound,cbcvel(:,:,1),['f','c','c'], &
-                                   mask_u,A_u,0._rp,.not.is_ibm_force,u)
+                                   mask_u,A_u,swz0,.not.is_ibm_force,u)
           call solve_helmholtz_ibm(n,alpha,av,bv,cv,rhsbv%x,rhsbv%y,rhsbv%z,is_bound,cbcvel(:,:,2),['c','f','c'], &
-                                   mask_v,A_v,0._rp,.not.is_ibm_force,v)
+                                   mask_v,A_v,swz0,.not.is_ibm_force,v)
           call solve_helmholtz_ibm(n,alpha,aw,bw,cw,rhsbw%x,rhsbw%y,rhsbw%z,is_bound,cbcvel(:,:,3),['c','c','f'], &
-                                   mask_w,A_w,0._rp,.not.is_ibm_force,w)
+                                   mask_w,A_w,swz0,.not.is_ibm_force,w)
         else
           call solve_helmholtz(n,ng,hi,arrplanu,normfftu,alpha, &
                                lambdaxyu,au,bu,cu,rhsbu%x,rhsbu%y,rhsbu%z,is_bound,cbcvel(:,:,1),['f','c','c'],u)
@@ -947,8 +1095,9 @@ program cans
           call apply_ibm_staircase(w,mask_w,dtrk)
         end if
         do nscalibm=1,nscal
+          if(scalars(nscalibm)%is_cht) cycle ! CHT: the scalar is solved inside the solid
           call apply_ibm_staircase_scalar(scalars(nscalibm)%val,&
-              mask_s,bcscal_ibm(nscalibm))
+              mask_s,swz(:,nscalibm))
         end do 
         call timer_toc('ibm_staircase',nvtx_gpu_stream=-1)
       endif
@@ -1015,7 +1164,7 @@ program cans
     end if
     if(icheck > 0.and.mod(istep,max(icheck,1)) == 0) then
       if(myid == 0) print*, 'Checking stability and divergence...'
-      call chkdt(n,dl,dzci,dzfi,visc,alpha_max,u,v,w,dt_cfl)
+      call chkdt(n,dl,dzci,dzfi,visc,alpha_max_eff,u,v,w,dt_cfl)
       dt = merge(dt_f,min(cfl*dt_cfl,dtmax),dt_f > 0.)
       if(myid == 0) print*, 'dt_cfl = ', dt_cfl, 'dt = ', dt
       if(dt_cfl < small) then
@@ -1049,7 +1198,24 @@ program cans
           kill = .true.
         end if
       end if
+      !
+      ! scalars: abort on a non-finite value (a NaN/Inf anywhere makes the volume mean non-finite)
+      !
+      do iscal=1,nscal
+        call bulk_mean(n,grid_vol_ratio_f,scalars(iscal)%val,meanscal)
+        if(is_nan(meanscal).or.abs(meanscal) > huge(meanscal)) then
+          if(myid == 0) print*, 'ERROR: scalar ', iscal, ' is not finite.'
+          if(myid == 0) print*, 'Aborting...'
+          is_done = .true.
+          kill = .true.
+        end if
+      end do
     end if
+    !
+    ! 3D time averages
+    !
+    if(iaverage > 0.and.mod(istep,max(iaverage,1)) == 0.and.time >= average_start_time) &
+      call stats3d_update(n,nscal,u,v,w,p,scalars)
     !
     ! output routines below
     !
@@ -1143,11 +1309,16 @@ program cans
         call out1d_chan_ibm(trim(datadir)//'turb_stats_ibm_'//fldnum//'.out',ng,lo,hi,l,dl,zc_g,u,v,w, &
                             mask_u,mask_v,mask_w,mask_s)
     endif
-    ! per-point IB wall outputs (every iout_wall steps)
+    !
+    ! per-point wall outputs, every `iout_wall` steps
+    !
     if(is_ibm_map) then
       call timer_tic('ibm_out',nvtx_color='m',nvtx_gpu_stream=-1)
       !$acc wait
       !$acc update self(u,v,w,p)
+      do iscal=1,nscal
+        !$acc update self(scalars(iscal)%val)
+      end do
       call calc_shear_st(fri_u,u,visc)
       call calc_shear_st(fri_v,v,visc)
       call calc_shear_st(fri_w,w,visc)
@@ -1180,13 +1351,30 @@ program cans
         call write_data(trim(datadir)//"fric-w_"//fldnum//".out",myid,fri_w_g)
         call write_data(trim(datadir)//"pressure"//fldnum//".out",myid,p_grad_g)
       endif
-      !FV method for calculating the wall friction 
-      call calc_wall_force(n,lo,l,dti_step,pi_drive,mask_s,frifv,frifvout) ! exact wall force per cell of this step
+      !
+      ! exact wall force per cell of this time step (FV method; analytic or level-set geometry)
+      !
+      call calc_wall_force(n,lo,l,dti_step,pi_drive,mask_s,frifv,frifvout)
       call writeFVfric(trim(datadir)//'FV-fric_'//trim(mpiranknum)//'_s_'//fldnum//'.out',frifvout)
-      ! wall stress map of the lower wall from the exact IB force of this time step
-      if(ibm_direction(0,3)) &
+      ! wall stress map of the lower wall from the exact IB force of this time step (analytic wall shape)
+      if(.not.is_sdf .and. ibm_direction(0,3)) &
         call out_ibm_wall_stress(trim(datadir)//'ibm_wall_stress_'//fldnum//'.out',n,lo,ng,l,dl,pi_drive,imp_map)
-      !this is for the fricition calculation w/ FVM
+      !
+      ! wall heat flux per cell, same cells and order as FV-fric (instantaneous, end of the time step);
+      ! wall_heat.out: time, total heat flow into the wall per scalar, and that in the output cells
+      !
+      if(is_wall_heat) then
+        do iscal=1,nscal
+          s => scalars(iscal)
+          call calc_wall_heat(iscal,nscal,n,lo,ng,is_per,dl,dzc,dzf,mask_s,thx,thy,thz,s%val, &
+                              s%alpha,s%alphas,s%is_cht,swz(:,iscal))
+        end do
+        call wall_heat_out(n,lo,nscal,mask_s,frifv,frhout,qwall)
+        call write_fv_rows(trim(datadir)//'FV-heat_'//trim(mpiranknum)//'_s_'//fldnum//'.out',frhout)
+        var(1) = time
+        var(2:1+2*nscal) = qwall(:)
+        call out0d(trim(datadir)//'wall_heat.out',1+2*nscal,var)
+      end if
       call timer_toc('ibm_out',nvtx_gpu_stream=-1)
     endif
     !
@@ -1264,6 +1452,7 @@ program cans
                          'fld_'//trim(c_io_vars(is))//trim(io_ext))
         end do
       end if
+      if(iaverage > 0) call stats3d_save(trim(datadir),ng,lo,hi,nscal,time,istep,xc_g,yc_g,zc_g,myid)
       if(myid == 0) print*, '*** Checkpoint saved at time = ', time, 'time step = ', istep, '. ***'
     end if
     call timer_toc(trim(merge('step_ibm_out','step        ',is_ibm_force)),nvtx_gpu_stream=-1)
@@ -1309,4 +1498,5 @@ program cans
   call cudecomp_finalize
 #endif
   call MPI_FINALIZE(ierr)
+  if(kill) error stop 1 ! aborted run (time step too small, divergence, non-finite scalar): non-zero exit status
 end program cans

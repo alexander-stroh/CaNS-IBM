@@ -10,7 +10,7 @@ module mod_scal
   use mod_solve_helmholtz, only: rhs_bound
   implicit none
   private
-  public scal,scalar,cmpt_scalflux,bulk_forcing_s,initialize_scalars
+  public scal,scal_cht,scalar,cmpt_scalflux,bulk_forcing_s,initialize_scalars
   !
   ! scalar derived type
   !
@@ -18,6 +18,10 @@ module mod_scal
     real(rp), allocatable, dimension(:,:,:) :: val
     real(rp), allocatable, dimension(:,:,:) :: dsdtrko
     real(rp) :: alpha
+    logical  :: is_cht    ! conjugate heat transfer: scalar also solved inside the IBM solid
+    real(rp) :: alphas    ! solid conductivity over the fluid heat capacity (= alpha*ks_kf)
+    real(rp) :: cs_cf     ! solid-to-fluid volumetric heat capacity ratio
+    real(rp) :: alpha_max ! largest effective diffusivity (conductivity over heat capacity)
     character(len=100) :: ini
     character(len=1), dimension(0:1,3) :: cbc
     real(rp),         dimension(0:1,3) :: bc
@@ -318,9 +322,92 @@ module mod_scal
     end if
   end subroutine bulk_forcing_s
   !
+  subroutine scal_cht(nx,ny,nz,dxi,dyi,dzci,dzfi,alphaf,alphas,cs_cf,u,v,w,thx,thy,thz,phi,s,dsdt,dsdtd)
+    use mod_param, only: is_impdiff
+    !
+    ! computes convective and diffusive fluxes of a scalar with conjugate heat transfer (CHT), i.e.,
+    ! solved in the fluid and inside the IBM solid, in the one-domain formulation
+    !
+    !   C dT/dt + u.grad(T) = div(k grad(T)) + q*phi ,
+    !
+    ! all properties relative to the fluid: k = alphaf (fluid), alphas (solid); C = 1 + (cs_cf-1)*(1-phi),
+    ! phi = fluid volume fraction of the cell; the conductivity at a cell face follows from the thermal
+    ! resistance of the centre-to-centre segment, of which the fraction th lies in the fluid:
+    !
+    !   k_face = 1/(th/alphaf + (1-th)/alphas),
+    !
+    ! (th = 1 or 0 for faces inside the fluid or solid; at the interface, th is the distance of the
+    ! fluid cell centre to the interface over the segment length, so that the flux is continuous at the
+    ! exact interface position; th = 1/2 reduces to the harmonic mean, interface at the cell face)
+    ! with implicit diffusion (`is_impdiff`), the full (variable-coefficient) diffusion is returned
+    ! in `dsdtd` and treated implicitly in all directions by `mod_cht`
+    !
+    implicit none
+    integer , intent(in) :: nx,ny,nz
+    real(rp), intent(in) :: dxi,dyi,alphaf,alphas,cs_cf
+    real(rp), intent(in), dimension(0:) :: dzci,dzfi
+    real(rp), dimension(0:,0:,0:), intent(in) :: u,v,w,s,thx,thy,thz,phi
+    real(rp), dimension(:,:,:), intent(out) :: dsdt
+    real(rp), dimension(:,:,:), intent(out), optional :: dsdtd
+    integer :: i,j,k
+    real(rp) :: usip,usim,vsjp,vsjm,wskp,wskm
+    real(rp) :: dsdxp,dsdxm,dsdyp,dsdym,dsdzp,dsdzm
+    real(rp) :: kxp,kxm,kyp,kym,kzp,kzm
+    real(rp) :: capi,diff_xy,diff_z,rf,rs
+    !
+    rf = 1./alphaf
+    rs = 1./alphas
+    !$acc parallel loop collapse(3) default(present) &
+    !$acc private(usip,usim,vsjp,vsjm,wskp,wskm,dsdxp,dsdxm,dsdyp,dsdym,dsdzp,dsdzm) &
+    !$acc private(kxp,kxm,kyp,kym,kzp,kzm,capi,diff_xy,diff_z) async(1)
+    !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared) &
+    !$OMP PRIVATE(usip,usim,vsjp,vsjm,wskp,wskm,dsdxp,dsdxm,dsdyp,dsdym,dsdzp,dsdzm) &
+    !$OMP PRIVATE(kxp,kxm,kyp,kym,kzp,kzm,capi,diff_xy,diff_z)
+    do k=1,nz
+      do j=1,ny
+        do i=1,nx
+          usim  = 0.5*( s(i-1,j,k)+s(i,j,k) )*u(i-1,j,k)
+          usip  = 0.5*( s(i+1,j,k)+s(i,j,k) )*u(i  ,j,k)
+          vsjm  = 0.5*( s(i,j-1,k)+s(i,j,k) )*v(i,j-1,k)
+          vsjp  = 0.5*( s(i,j+1,k)+s(i,j,k) )*v(i,j  ,k)
+          wskm  = 0.5*( s(i,j,k-1)+s(i,j,k) )*w(i,j,k-1)
+          wskp  = 0.5*( s(i,j,k+1)+s(i,j,k) )*w(i,j,k  )
+          dsdxp = (s(i+1,j,k)-s(i  ,j,k))*dxi
+          dsdxm = (s(i  ,j,k)-s(i-1,j,k))*dxi
+          dsdyp = (s(i,j+1,k)-s(i,j  ,k))*dyi
+          dsdym = (s(i,j  ,k)-s(i,j-1,k))*dyi
+          dsdzp = (s(i,j,k+1)-s(i,j,k  ))*dzci(k  )
+          dsdzm = (s(i,j,k  )-s(i,j,k-1))*dzci(k-1)
+          !
+          ! face conductivities (thx(i) refers to the face between cells i and i+1, etc.)
+          !
+          kxp = 1./(thx(i  ,j,k)*rf + (1.-thx(i  ,j,k))*rs)
+          kxm = 1./(thx(i-1,j,k)*rf + (1.-thx(i-1,j,k))*rs)
+          kyp = 1./(thy(i,j  ,k)*rf + (1.-thy(i,j  ,k))*rs)
+          kym = 1./(thy(i,j-1,k)*rf + (1.-thy(i,j-1,k))*rs)
+          kzp = 1./(thz(i,j,k  )*rf + (1.-thz(i,j,k  ))*rs)
+          kzm = 1./(thz(i,j,k-1)*rf + (1.-thz(i,j,k-1))*rs)
+          capi = 1./(1. + (cs_cf-1.)*(1.-phi(i,j,k)))
+          !
+          dsdt(i,j,k) = ( dxi*(     -usip + usim ) + &
+                          dyi*(     -vsjp + vsjm ) + &
+                          dzfi(k)*( -wskp + wskm ) )*capi
+          diff_xy = ( (kxp*dsdxp-kxm*dsdxm)*dxi + &
+                      (kyp*dsdyp-kym*dsdym)*dyi )*capi
+          diff_z  = (kzp*dsdzp-kzm*dsdzm)*dzfi(k)*capi
+          if(is_impdiff) then
+            dsdtd(i,j,k) = diff_xy + diff_z
+          else
+            dsdt(i,j,k)  = dsdt(i,j,k) + diff_xy + diff_z
+          end if
+        end do
+      end do
+    end do
+  end subroutine scal_cht
+  !
   subroutine initialize_scalars(scalars,nscal,n,n_z)
     use mod_param, only: alphai,iniscal,cbcscal,bcscal,ssource,is_sforced,scalf, &
-                         is_impdiff
+                         is_impdiff,is_cht,ks_kf,cs_cf
     !
     ! initializes/allocates members of an array of `nscal` scalar derived types
     !
@@ -347,6 +434,15 @@ module mod_scal
       scalars(iscal)%source    = ssource(iscal)
       scalars(iscal)%is_forced = is_sforced(iscal)
       scalars(iscal)%scalf     = scalf(iscal)
+      scalars(iscal)%is_cht    = is_cht(iscal)
+      scalars(iscal)%alphas    = scalars(iscal)%alpha*ks_kf(iscal)
+      scalars(iscal)%cs_cf     = cs_cf(iscal)
+      !
+      ! largest effective diffusivity (conductivity over heat capacity) in the domain, which sets
+      ! the time step limit when the diffusion is explicit
+      !
+      scalars(iscal)%alpha_max = scalars(iscal)%alpha
+      if(scalars(iscal)%is_cht) scalars(iscal)%alpha_max = max(scalars(iscal)%alpha,scalars(iscal)%alphas/scalars(iscal)%cs_cf)
     end do
   end subroutine initialize_scalars
 end module mod_scal

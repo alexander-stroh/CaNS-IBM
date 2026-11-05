@@ -22,14 +22,15 @@ module mod_initgrid
                           CLUSTER_ONE_END_R = 3, &
                           CLUSTER_MIDDLE    = 4, &
                           CLUSTER_ROUGH     = 5, &
-                          CLUSTER_ROUGH_TAN = 6
+                          CLUSTER_ROUGH_TAN = 6, &
+                          GRID_FILE         = 9  ! face coordinates zf(1:n) (or zf(0:n)) read from `grid_zf.in`
 
     integer , intent(in ) :: gtype,n
     real(rp), intent(in ) :: gr,lz
     real(rp), intent(out), dimension(0:n+1) :: dzc,dzf,zc,zf
     logical , intent(in ) :: is_periodic
-    real(rp) :: z0
-    integer :: k
+    real(rp) :: z0,zorig
+    integer :: k,ierr
     procedure (), pointer :: gridpoint => null()
     real(rp),intent(in),optional            :: visc,dzp_min_goal,dzp_max_goal
     real(rp),intent(in),optional            :: hch,hmax
@@ -77,7 +78,31 @@ module mod_initgrid
     ! step 1) determine coordinates of cell faces zf
     !
     zf(0) = 0.
-    if(.not.is_gridpoint_natural_channel.and.gtype/=CLUSTER_ROUGH) then
+    zorig = 0.
+    if(gtype == GRID_FILE) then
+      !
+      ! absolute coordinates of the cell faces zf(1:n), one per line, with zf(n) = lz; or n+1 values zf(0:n),
+      ! zf(n) - zf(0) = lz: the domain then starts at z = zf(0) (origin shift of all z coordinates, step 5)
+      !
+      open(newunit=iunit,file='grid_zf.in',status='old',action='read',iostat=ierr)
+      if(ierr == 0) read(iunit,*,iostat=ierr) zf(0:n)
+      if(ierr == 0) then
+        zorig = zf(0); zf(0:n) = zf(0:n) - zorig
+      else
+        rewind(iunit); zf(0) = 0.
+        read(iunit,*,iostat=ierr) zf(1:n)
+      end if
+      if(ierr /= 0) then
+        print*, 'ERROR: `gtype = 9` requires the file `grid_zf.in` with ', n, ' (or ', n+1, ') face coordinates.'
+        error stop
+      end if
+      close(iunit)
+      if(abs(zf(n)-lz) > 1.e-8*lz.or.any(zf(1:n)-zf(0:n-1) <= 0.)) then
+        print*, 'ERROR: `grid_zf.in` must be increasing and span l(3) = ', lz, '; span: ', zf(n)
+        error stop
+      end if
+      zf(n) = lz
+    else if(.not.is_gridpoint_natural_channel.and.gtype/=CLUSTER_ROUGH) then
       do k=1,n
         z0  = (k-0.)/(1.*n)
         call gridpoint(gr,z0,zf(k))
@@ -89,11 +114,11 @@ module mod_initgrid
         call gridpoint_natural(k,n,zf(k))
       end do
     end if
-    if(gtype/=CLUSTER_ROUGH)then
+    if(gtype/=CLUSTER_ROUGH.and.gtype/=GRID_FILE)then
       zf(1:n) = zf(1:n)*lz
     endif
     !
-    if(abs(gr) < epsilon(1._rp) .and. gtype/=CLUSTER_ROUGH) then
+    if(abs(gr) < epsilon(1._rp) .and. gtype/=CLUSTER_ROUGH .and. gtype/=GRID_FILE) then
       !
       ! for uniform grids, set constant spacing to avoid round-off errors
       !
@@ -134,6 +159,11 @@ module mod_initgrid
       zc(k) = zc(k-1) + dzc(k-1)
       zf(k) = zf(k-1) + dzf(k)
     end do
+    !
+    ! step 5) origin of the z coordinate (`grid_zf.in` with zf(0:n), else 0)
+    !
+    zc(:) = zc(:) + zorig
+    zf(:) = zf(:) + zorig
     !lets get diagnostics 
     if(diagnostics.eqv..true..and.gtype==CLUSTER_ROUGH)then
       if(present(myid))then

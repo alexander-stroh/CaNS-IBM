@@ -49,6 +49,8 @@ logical , protected, dimension(3) :: stop_type
 logical , protected :: restart,is_overwrite_save
 integer , protected :: nsaves_max
 integer , protected :: icheck,iout0d,iout1d,iout2d,iout3d,isave
+integer , protected :: iaverage           ! 3D time averages every iaverage steps for time >= average_start_time (0: off)
+real(rp), protected :: average_start_time
 !
 integer , dimension(2) :: dims ! not protected -> overwritten when autotuning
 integer , protected :: ipencil_axis = 1
@@ -86,6 +88,14 @@ real(rp), protected :: alpha_max
 ! scalar-ibm
 character(len=1)  , protected, allocatable, dimension(:) :: cbcscal_ibm ! size (nscal)
 real(rp)          , protected, allocatable, dimension(:) ::  bcscal_ibm ! size (nscal)
+real(rp)          , protected, allocatable, dimension(:) ::  bcscal_ibm_top ! size (nscal), IB value above the domain mid-plane
+!
+! conjugate heat transfer (CHT): scalar also solved inside the IBM solid, with
+! ks_kf = solid-to-fluid conductivity ratio and cs_cf = solid-to-fluid volumetric heat capacity ratio
+!
+logical , protected, allocatable, dimension(:) :: is_cht ! size (nscal)
+real(rp), protected, allocatable, dimension(:) :: ks_kf  ! size (nscal)
+real(rp), protected, allocatable, dimension(:) :: cs_cf  ! size (nscal)
 !
 #if defined(_OPENACC)
 !
@@ -130,7 +140,12 @@ character(len=16), protected :: ibm_shape = 'macdonald' ! analytic wall shape: '
 real(rp), protected   :: ibm_hch = -1._rp ! reference half height for the rough-wall grid (gtype = 5)
 character(len=16), protected :: bulk_vel_def = 'superficial' ! IBM bulk velocity: 'superficial' or 'intrinsic'
 character(len=16), protected :: ibm_proj = 'none' ! IB-aware velocity correction: 'none' or 'damped'
-integer , protected   :: ibm_iout_wall = -1 ! interval of the per-point wall outputs (< 0: iout1d)
+integer , protected   :: ibm_iout_wall = -1 ! interval of the per-point wall outputs (< 0: iout1d, 0: off)
+! geometry of the IBM: 'analytic' (`isInbody`, wavy walls/height map) or 'sdf' (signed-distance level set
+! at the cell centres read from `sdf_file`, see `mod_ibm_sdf`)
+character(len=16) , protected :: geometry = 'analytic'
+character(len=100), protected :: sdf_file = 'data/sdfp.bin'
+logical           , protected :: dump_ibm_geometry = .false. ! write the IBM/CHT geometry fields (serial runs)
 !hmap
 logical,protected     :: use_hmap=.false.
 character(len=25), protected :: hmap_mode="fit"
@@ -160,6 +175,7 @@ contains
                   stop_type, &
                   restart,is_overwrite_save,nsaves_max, &
                   icheck,iout0d,iout1d,iout2d,iout3d,isave, &
+                  iaverage,average_start_time, &
                   cbcvel,cbcpre,bcvel,bcpre, &
                   bforce, &
                   is_forced, &
@@ -179,8 +195,9 @@ contains
                      alphai,beta, &
                      iniscal, &
                      cbcscal,bcscal, &
-                     cbcscal_ibm,bcscal_ibm,&
+                     cbcscal_ibm,bcscal_ibm,bcscal_ibm_top,&
                      const_scal,scal_mean_grad,&
+                     is_cht,ks_kf,cs_cf,&
                      ssource, &
                      is_sforced, &
                      scalf, &
@@ -207,7 +224,10 @@ contains
                             ibm_hch,          &
                             bulk_vel_def,     &
                             ibm_proj,         &
-                            ibm_iout_wall
+                            ibm_iout_wall,    &
+                            geometry,         &
+                            sdf_file,         &
+                            dump_ibm_geometry
     namelist /hmap/ &
                             use_hmap,         &
                             hmap_mode,        &        
@@ -221,6 +241,8 @@ contains
     dt_f = -1.
     gacc(:) = 0.
     nscal = 0
+    iaverage = 0
+    average_start_time = 0.
     !
     ! use a custom input file if one was provided on the command line
     !
@@ -340,7 +362,8 @@ contains
         !
         allocate(alphai(nscal),iniscal(nscal), &
                  cbcscal(0:1,3,nscal),bcscal(0:1,3,nscal), &
-                 cbcscal_ibm(nscal),bcscal_ibm(nscal),&
+                 cbcscal_ibm(nscal),bcscal_ibm(nscal),bcscal_ibm_top(nscal),&
+                 is_cht(nscal),ks_kf(nscal),cs_cf(nscal),&
                  ssource(nscal),is_sforced(nscal),scalf(nscal),scal_mean_grad(nscal))
         !
         ! set default values
@@ -351,8 +374,12 @@ contains
         scalf(:)      = 0.
         cbcscal_ibm(:) = "D"
         bcscal_ibm(:)  = 0._rp
+        bcscal_ibm_top(:) = huge(1._rp) ! unset: same as bcscal_ibm
         const_scal     = .true.
         scal_mean_grad(:) = -1._rp
+        is_cht(:)      = .false.
+        ks_kf(:)       = 1._rp
+        cs_cf(:)       = 1._rp
         !
         ! read `scalar` namelist
         !
@@ -365,6 +392,7 @@ contains
           close(iunit)
           error stop
         end if
+        where(bcscal_ibm_top(:) == huge(1._rp)) bcscal_ibm_top(:) = bcscal_ibm(:)
       else
         nscal = 0 ! negative values equivalent to nscal = 0
       end if
@@ -469,7 +497,26 @@ contains
         call MPI_FINALIZE(ierr)
         close(iunit)
         error stop
-      end if  
+      end if
     close(iunit)
+    !
+    ! checks of the CHT input (the `ibm` namelist is read after `scalar`)
+    !
+    if(nscal > 0) then
+      if(any(is_cht(:))) then
+        if(.not.is_ibm) then
+          if(myid == 0) print*, 'ERROR: reading the input file: `is_cht = T` requires `is_ibm = T`.'
+          if(myid == 0) print*, 'Aborting...'
+          call MPI_FINALIZE(ierr)
+          error stop
+        end if
+        if(any(ks_kf(:) <= 0._rp).or.any(cs_cf(:) <= 0._rp)) then
+          if(myid == 0) print*, 'ERROR: reading the input file: `ks_kf` and `cs_cf` must be positive.'
+          if(myid == 0) print*, 'Aborting...'
+          call MPI_FINALIZE(ierr)
+          error stop
+        end if
+      end if
+    end if
   end subroutine read_input
 end module mod_param

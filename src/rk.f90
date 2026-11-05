@@ -19,7 +19,8 @@ module mod_rk
                        mom_xyz_ad
   use mod_param, only: is_impdiff,is_impdiff_1d,is_boussinesq_buoyancy,is_fast_mom_kernels,is_ibm,const_scal, &
                        adv_form,bulk_vel_def
-  use mod_scal , only: scal,cmpt_scalflux,scalar
+  use mod_scal , only: scal,scal_cht,cmpt_scalflux,scalar
+  use mod_cht  , only: cht_solve
   use mod_utils, only: bulk_mean,bulk_mean_ibm
   use mod_types
   implicit none
@@ -446,10 +447,17 @@ module mod_rk
   end subroutine rk
   !
   subroutine rk_scal(rkpar,n,dli,l,dzci,dzfi,grid_vol_ratio_f,alpha,dt,is_bound,u,v,w, &
-                     is_forced,scalf,ssource,fluxo,dsdtrko,s,f,A_s,B_s,sw,sgrad,mask_s)
+                     is_forced,scalf,ssource,fluxo,dsdtrko,s,f,A_s,B_s,sw,sgrad,mask_s, &
+                     is_cht,alphas,cs_cf,cbcz,thx,thy,thz,phi)
 #if defined(_OPENACC)
     use mod_common_cudecomp, only: dsdtrk_t => work
 #endif
+    !
+    ! conjugate heat transfer (`is_cht`): the scalar is solved in the fluid and inside the IBM solid
+    ! (see `scal_cht`, `rk_scal_cht`); the diffusion is then either explicit or, with `is_impdiff`, fully
+    ! implicit in all directions (delta form of Crank-Nicolson with approximate factorization, see
+    ! `mod_cht`); the volumetric source acts in the fluid only (times the fluid volume fraction `phi`);
+    ! the 2nd-order IBM factors A_s/B_s, the wall value and the Helmholtz solve do not apply
     !
     ! low-storage 3rd-order Runge-Kutta scheme
     ! for time integration of the scalar field.
@@ -484,10 +492,18 @@ module mod_rk
     real(rp) :: mean
     real(rp),intent(in) :: A_s(0:,0:,0:)
     real(rp),intent(in) :: B_s(0:,0:,0:)
-    real(rp),intent(in) :: sw ! IBM wall value; the IB term relaxes s - sw, hence the (A_s-B_s)*sw term
+    real(rp),intent(in), dimension(0:) :: sw ! IBM wall value per level k; the IB term relaxes s - sw, hence the (A_s-B_s)*sw term
     real(rp),intent(in) :: sgrad ! imposed mean streamwise gradient (used if .not.const_scal)
     logical ,intent(in), dimension(0:,0:,0:), optional :: mask_s ! present if is_ibm
     real(rp) :: gain
+    logical , intent(in), optional :: is_cht
+    real(rp), intent(in), optional :: alphas,cs_cf
+    character(len=1), intent(in), dimension(0:1), optional :: cbcz
+    real(rp), intent(in), dimension(0:,0:,0:), optional :: thx,thy,thz,phi
+    logical  :: is_cht_
+    !
+    is_cht_ = .false.
+    if(present(is_cht)) is_cht_ = is_cht
     !
     factor1 = rkpar(1)*dt
     factor2 = rkpar(2)*dt
@@ -526,6 +542,15 @@ module mod_rk
     dsdtrk => dsdtrk_t
 #endif
     !
+    if(is_cht_) then
+      !
+      ! all device loops of the CHT update work on non-optional dummy arguments (see `rk_scal_cht`)
+      !
+      call rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas,cs_cf,ssource, &
+                       is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f)
+      return
+    end if
+    !
     call scal(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,alpha,u,v,w,s,dsdtrk,dsdtrkd)
     if(.not.const_scal) then
       !
@@ -548,7 +573,7 @@ module mod_rk
     do k=1,n(3)
       do j=1,n(2)
         do i=1,n(1)
-          s(i,j,k) = (B_s(i,j,k)*s(i,j,k) + (A_s(i,j,k)-B_s(i,j,k))*sw + factor1*dsdtrk(i,j,k) + factor2*dsdtrko(i,j,k) &
+          s(i,j,k) = (B_s(i,j,k)*s(i,j,k) + (A_s(i,j,k)-B_s(i,j,k))*sw(k) + factor1*dsdtrk(i,j,k) + factor2*dsdtrko(i,j,k) &
                       + factor12*ssource)/A_s(i,j,k)
           if(is_impdiff) then
             s(i,j,k) = s(i,j,k) + factor12*dsdtrkd(i,j,k)/A_s(i,j,k)
@@ -563,7 +588,7 @@ module mod_rk
       do k=1,n(3)
         do j=1,n(2)
           do i=1,n(1)
-            s(i,j,k) = (B_s(i,j,k)*s(i,j,k) + (A_s(i,j,k)-B_s(i,j,k))*sw + factor1*dsdtrk(i,j,k) + factor2*dsdtrko(i,j,k) &
+            s(i,j,k) = (B_s(i,j,k)*s(i,j,k) + (A_s(i,j,k)-B_s(i,j,k))*sw(k) + factor1*dsdtrk(i,j,k) + factor2*dsdtrko(i,j,k) &
                                             + factor12*ssource)/A_s(i,j,k)
           end do
         end do
@@ -574,7 +599,7 @@ module mod_rk
       do k=1,n(3)
         do j=1,n(2)
           do i=1,n(1)
-            s(i,j,k) = (B_s(i,j,k)*s(i,j,k) + (A_s(i,j,k)-B_s(i,j,k))*sw + factor1*dsdtrk(i,j,k) + factor2*dsdtrko(i,j,k) + &
+            s(i,j,k) = (B_s(i,j,k)*s(i,j,k) + (A_s(i,j,k)-B_s(i,j,k))*sw(k) + factor1*dsdtrk(i,j,k) + factor2*dsdtrko(i,j,k) + &
                                 factor12*(ssource + dsdtrkd(i,j,k)))/A_s(i,j,k)
           end do
         end do
@@ -630,6 +655,82 @@ module mod_rk
       end do
     end do
   end subroutine rk_scal
+  !
+  subroutine rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas_in,cs_cf_in,ssource_in, &
+                         is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f)
+    !
+    ! Runge-Kutta substep of a scalar with conjugate heat transfer (see `rk_scal`, `scal_cht`, `mod_cht`);
+    ! all arguments are non-optional, and the scalar inputs are copied to locals, so that the
+    ! asynchronous device loops only reference plain (present) data
+    !
+    implicit none
+    integer , intent(in), dimension(3) :: n
+    real(rp), intent(in), dimension(3) :: dli
+    real(rp), intent(in), dimension(0:) :: dzci,dzfi
+    real(rp), intent(in), dimension(:) :: grid_vol_ratio_f
+    real(rp), intent(in) :: factor1,factor2,factor12,alpha,alphas_in,cs_cf_in,ssource_in
+    logical , intent(in) :: is_forced
+    real(rp), intent(in) :: scalf
+    real(rp), intent(in), dimension(0:,0:,0:) :: u,v,w,thx,thy,thz,phi
+    character(len=1), intent(in), dimension(0:1) :: cbcz
+    real(rp), intent(inout), dimension(:,:,:) :: dsdtrk,dsdtrkd,dsdtrko
+    real(rp), intent(inout), dimension(0:,0:,0:) :: s
+    real(rp), intent(out) :: f
+    real(rp) :: alphas,cs_cf,ss,f1,f2,f12,capi,mean
+    integer :: i,j,k
+    alphas = alphas_in; cs_cf = cs_cf_in; ss = ssource_in
+    f1 = factor1; f2 = factor2; f12 = factor12
+    call scal_cht(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,alpha,alphas,cs_cf,u,v,w,thx,thy,thz,phi,s,dsdtrk,dsdtrkd)
+    if(is_impdiff) then
+      !
+      ! delta form of Crank-Nicolson with approximate factorization in x, y and z (see `mod_cht`);
+      ! dsdtrkd holds the full diffusion at the current level on input, and dT after `cht_solve`;
+      ! the previous slope is stored before the solve (on GPUs, dsdtrk aliases the work buffer)
+      !
+      !$acc parallel loop collapse(3) default(present) private(capi) async(1)
+      !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared) PRIVATE(capi)
+      do k=1,n(3)
+        do j=1,n(2)
+          do i=1,n(1)
+            capi = 1._rp/(1._rp + (cs_cf-1._rp)*(1._rp-phi(i,j,k)))
+            dsdtrkd(i,j,k) = f1*dsdtrk(i,j,k) + f2*dsdtrko(i,j,k) + &
+                             f12*(ss*phi(i,j,k)*capi + dsdtrkd(i,j,k))
+            dsdtrko(i,j,k) = dsdtrk(i,j,k)
+          end do
+        end do
+      end do
+      call cht_solve(n,0.5_rp*f12,alpha,alphas,cs_cf,cbcz,dsdtrkd)
+      !$acc parallel loop collapse(3) default(present) async(1)
+      !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared)
+      do k=1,n(3)
+        do j=1,n(2)
+          do i=1,n(1)
+            s(i,j,k) = s(i,j,k) + dsdtrkd(i,j,k)
+          end do
+        end do
+      end do
+    else
+      !$acc parallel loop collapse(3) default(present) private(capi) async(1)
+      !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared) PRIVATE(capi)
+      do k=1,n(3)
+        do j=1,n(2)
+          do i=1,n(1)
+            capi = 1._rp/(1._rp + (cs_cf-1._rp)*(1._rp-phi(i,j,k)))
+            s(i,j,k) = s(i,j,k) + f1*dsdtrk(i,j,k) + f2*dsdtrko(i,j,k) + f12*ss*phi(i,j,k)*capi
+            dsdtrko(i,j,k) = dsdtrk(i,j,k)
+          end do
+        end do
+      end do
+    end if
+    !
+    ! bulk scalar forcing
+    !
+    f = 0._rp
+    if(is_forced) then
+      call bulk_mean(n,grid_vol_ratio_f,s(:,:,:),mean)
+      f = scalf - mean
+    end if
+  end subroutine rk_scal_cht
   !
   subroutine cmpt_bulk_forcing(n,is_forced,velf,grid_vol_ratio_c,grid_vol_ratio_f,u,v,w,f)
     implicit none
