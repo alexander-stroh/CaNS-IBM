@@ -63,6 +63,7 @@ These lines set the computational grid.
 * `2`: grid clustered towards the lower end
 * `3`: grid clustered towards the upper end
 * `4`: grid clustered towards the middle
+* `9`: face coordinates read from the file `grid_zf.in` in the run directory: `ng(3)` values `zf(1:n)` with `zf(n) = l(3)`, or `ng(3)+1` values `zf(0:n)` with `zf(n) - zf(0) = l(3)`, in which case all z coordinates are shifted so that the domain starts at `zf(0)`; `gr` is ignored
 
 ---
 
@@ -219,6 +220,13 @@ This line sets the domain decomposition and orientation of the computational sub
 
 `ipencil_axis` sets the **orientation of the computational subdomains** (or pencils), being one of `[1,2,3]` for `[X,Y,Z]`-aligned pencils. X-aligned is the default if this option is not set, and should be optimal for all cases except for Z-implicit diffusion, where Z-pencils are recommended if `dims(2) > 1` in the input file; see the description of the `&numerics` namelist below.
 
+---
+
+```fortran
+iaverage = 0, average_start_time = 0.
+```
+**3D time averages** (`&dns`): every `iaverage` steps (0: off) for `time >= average_start_time`, the running means of u, v, w (at the cell centres), p, uu, vv, ww, uv, uw, vw and, per scalar, s, s², u s and w s are updated. They are written at every checkpoint as `data/<name>_mean.bin` (for visualization; `vex`, `vey`, `vez`, `p`, `u2`, `v2`, `w2`, `uv`, `uw`, `vw`, `s_<nnn>`, `s2_<nnn>`, `us_<nnn>`, `ws_<nnn>`), `data/<name>_mean_res.bin` (for restarting, with the time appended) and `data/count_avg.out` (number of samples). On restart the averages continue from these files if present.
+
 # About the `&cudecomp` namelist under `input.nml`
 
 In addition to the `&dns` namelist in the input file, there is an **optional** namelist to set some runtime configurations for the *cuDecomp* library. Consider the following `&cudecomp` namelist, which corresponds to the default options in case the file is not provided:
@@ -342,6 +350,33 @@ If `const_scal` is false (default true), each scalar `s` is the fluctuation abou
 
 ---
 
+**Conjugate heat transfer with the immersed boundary** (`is_ibm = T`)
+
+```fortran
+is_cht(1)     = T
+ks_kf(1)      = 10.
+cs_cf(1)      = 1.
+ssource(1)    = 1.
+ssource_s(1)  = 0.
+qw_ibm(1)     = 0.
+qw_ibm_eps    = 1.5
+bcscal_ibm_top(1) = 0.
+```
+With `is_cht = T` (array of size `nscal`, default `F`) the scalar is also solved inside the IBM solid, in one domain:
+
+`C dT/dt + u.grad(T) = div(k grad(T)) + ssource*phi + ssource_s*(1-phi) + qw_ibm*a`,
+
+with all properties relative to the fluid: `k = alpha` in the fluid and `alpha*ks_kf` in the solid, `C = 1 + (cs_cf-1)*(1-phi)`, `phi` the fluid volume fraction of the cell, and `a` the interface area per unit volume. `ks_kf` and `cs_cf` are the solid-to-fluid **conductivity** and **volumetric heat-capacity** ratios (default 1). The conductivity at a cell face comes from the series resistance of the segment between the two cell centres, `k_face = 1/(th/k_f + (1-th)/k_s)`, where `th` is the fluid fraction of the segment taken at the exact interface position, so the heat flux crossing the interface is continuous there; the interface conditions (continuity of T and of the normal heat flux) are not imposed separately. `cbcscal_ibm`/`bcscal_ibm` are not used for CHT scalars.
+
+* `ssource` acts in the fluid and `ssource_s` (default 0) in the solid, both weighted with the volume fractions of the cut cells.
+* `qw_ibm` (default 0) is a **heat flux released at the interface** per unit area (a jump of the normal heat flux, `-k_s dT/dn|_s + qw_ibm = -k_f dT/dn|_f`, n into the fluid), deposited with a smoothed delta function of half-width `qw_ibm_eps` grid spacings about the zero level of the level set; it requires `geometry = 'sdf'`.
+* Diffusion is explicit by default, with the time step limited by the largest diffusivity `max(alpha, alpha*ks_kf/cs_cf)`. With `&numerics is_impdiff = T` it is integrated implicitly in all three directions (Crank-Nicolson in delta form, approximately factorized, Douglas ADI); this is stable for solid-to-fluid diffusivity ratios `ks_kf/cs_cf` up to about 100, not at 1000.
+* A non-finite scalar value stops the run with exit code 1.
+
+`bcscal_ibm_top` (non-CHT scalars, default `bcscal_ibm`) is the IB value of the scalar above the domain mid-plane (z > l(3)/2), e.g. a different temperature on the upper wall.
+
+---
+
 **Buoyancy effects**
 
 The input value `beta` above is the thermal expansion coefficient that relates density to temperature in the so-called _Boussinesq approximation_, thereby triggering buoyancy-induced momentum transport. Its default value is zero. When buoyancy is activated, **the first scalar is always associated with the temperature difference**. Moreover, in that case, the value for the **gravitational acceleration vector** `gacc` should be provided in the `&dns` namelist:
@@ -383,6 +418,11 @@ Finally, `is_poisson_pcr_tdma`, if `.true.`, allows for solving the Poisson/Helm
 
 The two forms differ only by the term `u*div(u)/2`, so they coincide for a discretely divergence-free field. Before this option existed, `is_ibm = T` forced `'div'` when `is_fast_mom_kernels = F`.
 
+```fortran
+is_ibm_damp = F, ibm_damp_eps = 0.02, ibm_damp_d = 3., 6.
+```
+`is_ibm_damp` adds an optional fourth-difference hyperviscosity in x near the immersed boundary, `-ibm_damp_eps*sigma*|u|*dx^3*d4/dx4`, to u, v, w and the scalars, against odd-even (2 dx) oscillations that sharp IB edges can trigger. `sigma = 1` where the level set is below `ibm_damp_d(1)*dx`, with a cosine ramp to 0 at `ibm_damp_d(2)*dx`. It requires `geometry = 'sdf'` and an x direction that is not decomposed. The x stencil also reaches into the solid next to the wall and adds a small drag (about 1 % in the skin friction at `ibm_damp_eps = 0.04` on a truncated-cone surface); it is off by default.
+
 # About the `&ibm` namelist under `input.nml` (selected entries)
 
 ```fortran
@@ -392,6 +432,10 @@ ibm_hch      = -1.
 bulk_vel_def = 'superficial'
 ibm_proj     = 'none'
 ibm_iout_wall = -1
+geometry     = 'analytic'
+sdf_file     = 'data/sdfp.bin'
+dump_ibm_geometry = F
+mproj_tol    = 1.e-3, mproj_maxit = 50
 /
 ```
 `ibm_shape` selects the analytic wall shape (with `&hmap use_hmap = F`). For a wall normal to direction `t` on side `s` (`ibm_direction(s,t) = T`), with in-plane directions `i = mod(t,3)+1` and `ii = mod(t+1,3)+1`, and the bottom wall at `l_0(0,t) + h`, the top wall at `l_0(1,t) - h`:
@@ -402,6 +446,12 @@ The roughness height range printed at start-up (`hmin`, `hmax`) is sampled from 
 
 `ibm_hch` is the reference half height (`Re_tau = ibm_hch/visc`) of the rough-wall grid `gtype = 5`, whose uniform fine region extends from `z = 0` to `hmax`. It is required for `gtype = 5` (with a height map, the value from the map's info file is used if `ibm_hch` is not set).
 
+`geometry` selects how the immersed boundary is described:
+* `'analytic'` (default): the wall shapes of `ibm_shape` or the height map of `&hmap`.
+* `'sdf'`: a **level set** (signed distance, > 0 in the fluid) at the cell centres, read from `sdf_file`: raw float64, `ng(1)*ng(2)*ng(3)` values, x fastest, no header. It is interpolated linearly to the staggered velocity positions; the wall distance on each grid line comes from a quadratic crossing through three points, and the fluid volume fraction of a cut cell from the second-order Taylor expansion of the level set about the cell centre. Any geometry can be used (several bodies, overhangs, closed bodies); the solver needs the correct sign everywhere and a smooth, accurate zero level within about two cells of the wall, while `|grad phi| = 1` matters only for the per-point wall outputs and `is_ibm_damp`. Generators: `utils/sdf/hmap_sdf.py` (height maps) and `utils/sdf/stl_sdf.py` (STL surfaces). At least two cells per task along z are needed.
+
+`dump_ibm_geometry = T` writes `data/ibm_geometry.bin` (serial runs only): the IB coefficients `lap_u, lap_v, lap_w, lap_s` and, with CHT scalars, the face fractions `thx, thy, thz` and the volume fractions `phi`, each `n(1)*n(2)*n(3)` doubles.
+
 `bulk_vel_def` is described with `velf` above.
 
 `ibm_proj` selects the velocity correction after the pressure Poisson equation, which is solved with the standard (not IB-aware) FFT solver:
@@ -410,13 +460,17 @@ The roughness height range printed at start-up (`hmin`, `hmax`) is sampled from 
 
 In tests (turbulent channel over the MacDonald wall, 64^3) the two options give the same errors and temporal order (2 at the band points) to three digits; `'damped'` removes only the solid leakage. A lagged pre-compensation of the predictor with the previous pressure correction (Kim-Moin type) was tested and is unstable: the zeroing of the solid points at each stage start already acts as such a pre-compensation.
 
+* `'masked'`: an IB-consistent projection (Seo & Mittal, J. Comput. Phys. 230 (2011) 7347, with binary face apertures M, 0 at the solid velocity points): `D(M G p) = D(u*)/dt`, `u = M (u* - dt G p)`, solved by conjugate gradients preconditioned with the FFT Poisson solver, to the relative residual `mproj_tol` or at most `mproj_maxit` iterations per RK stage. The velocity is then zero at the solid points and divergence free in every cell, including the cut cells. It costs about 15 iterations per stage (several times the cost of a time step); on a rough-wall test it left the statistics unchanged.
+
 `ibm_iout_wall` is the interval, in time steps, of the per-point wall outputs `fric-*`, `pressure*`, `FV-fric_*` and `ibm_wall_stress_*` below. A negative value (default) uses `iout1d`; `0` switches them off. The plane statistics `turb_stats_*` stay at `iout1d`. On fine grids the per-cell files are large (one line per cut cell), so a larger interval than `iout1d` keeps the statistics frequent without them.
 
 IB force output (with `is_ibm = T`):
 * `data/ibm_force.out`, every `iout0d` steps: the force the IB exerts on the fluid in that time step, per unit box volume (positive = drag), computed exactly from the momentum the IB removes from the plain explicit update. Columns: time; driving force `bforce - dpdl` (x, y, z); total IB force (x, y, z); its parts in the lower and upper halves of the domain (x, y, z each); the parts from the fluid (band) points, i.e. the `lambda` term, from the solid points (predictor zeroed), and from the projection leakage into the solid (x, y, z each). With `ibm_proj = 'damped'` there are three more columns, the part of the damped correction at the fluid (band) points; its solid-point part is included in the leakage columns. At steady state, total IB force + stresses on the domain walls = driving force. The drag on a z-wall is the total minus the driving force on the solid volume (`pi*h` per unit plan area). The z component includes the pressure inside the solid and on the domain boundary, so it is not a wall force.
 * `data/ibm_wall_stress_<step>.out`, every `iout1d` steps (lower z-wall only): plan-view map of the wall stress, `tau(i,j) = F(i,j)/(dx dy) - pi h(x,y)`, where `F(i,j)` is the IB force integrated over the lower half of the column and `h` is the wall height. Columns: i, j, tau_x at (xf(i),yc(j)), tau_y at (xc(i),yf(j)). Its mean is the drag per unit plan area.
 * `data/turb_stats_ibm_<step>.out`, every `iout1d` steps (z-walls), next to `turb_stats_<step>.out` (unchanged, superficial over all points including the solid): plane statistics over the fluid points only. Columns: z; fluid fractions `phi` of the u-, v- and cell-centre points; intrinsic means of u, v, w; intrinsic covariances u'u', v'v', w'w', u'w', u'v', v'w' (w and the products with w at the cell centres, over the fluid cells, with the solid faces counted as 0). Superficial means are `phi` times the intrinsic ones. In a fully solid plane the values are 0.
-* `data/FV-fric_<rank>_s_<step>.out`, every `iout1d` steps, one file per task: the wall force per cell in that time step, for every cell that contains a piece of the wall. It is the exact IB force of `ibm_force.out` distributed over the cells, so its sum is the drag of `ibm_wall_stress_*.out` (up to the solid volume of the cut cells, sampled with 20^3 points per cell). Each velocity node next to the wall passes its IB impulse to the cell in which its wall point lies. For a band node this is the `lambda` part, split over the wall directions in proportion to `lambda`. For a solid node it is the local momentum flux from its fluid neighbours. The pressure part of the solid nodes is telescoped onto the cut cells: a cell gets `p - p_mean` times its face area for each solid face, with the sign of the face, so the pressure inside the solid cancels. The driving force on the solid part of the cell is subtracted. Columns: i, j, k (global); wall area; unit normal out of the solid (x, y, z); force of the fluid on the wall F (x, y, z); its normal part `F.n` and vector; its tangential part (magnitude, vector); the same divided by the wall area (normal stress `F.n/A`, i.e. minus the wall pressure relative to the fluid-mean pressure, and shear stress). The values are local, but a cell holds the force of the nodes next to its piece of wall, not a pointwise traction.
+* `data/FV-fric_<rank>_s_<step>.out`, every `iout1d` steps, one file per task: the wall force per cell in that time step, for every cell that contains a piece of the wall. It is the exact IB force of `ibm_force.out` distributed over the cells, so its sum is the drag of `ibm_wall_stress_*.out` (up to the solid volume of the cut cells, sampled with 20^3 points per cell). Each velocity node next to the wall passes its IB impulse to the cell in which its wall point lies. For a band node this is the `lambda` part, split over the wall directions in proportion to `lambda`. For a solid node it is the local momentum flux from its fluid neighbours. The pressure part of the solid nodes is telescoped onto the cut cells: a cell gets `p - p_mean` times its face area for each solid face, with the sign of the face, so the pressure inside the solid cancels. The driving force on the solid part of the cell is subtracted. Columns: i, j, k (global); wall area; unit normal out of the solid (x, y, z); force of the fluid on the wall F (x, y, z); its normal part `F.n` and vector; its tangential part (magnitude, vector); the same divided by the wall area (normal stress `F.n/A`, i.e. minus the wall pressure relative to the fluid-mean pressure, and shear stress). The values are local, but a cell holds the force of the nodes next to its piece of wall, not a pointwise traction. With `geometry = 'sdf'` the wall points, the solid volume, the wall area and the normal of each cell come from the level set (the area and normal from the signed projected areas of the sub-cell solid/fluid faces).
+* `data/FV-heat_<rank>_s_<step>.out`, with scalars, whenever the wall outputs are on (`ibm_iout_wall /= 0`), same cells and order as `FV-fric`: the wall heat flux per cell, from the diffusive face fluxes of the segments between a fluid and a solid cell centre (CHT: the series resistance of the face, the flux the solver uses; non-CHT: a linear profile from the fluid node to the wall value at the distance `th*h`), assigned to the cell that contains the interface point. Columns: i, j, k (global); wall area; unit normal (x, y, z); per scalar the heat flow Q from the fluid into the wall, Q divided by the wall area, and the interface temperature (mean over the crossed faces).
+* `data/wall_heat.out`, at the same steps: time; the total heat flow into the wall of each scalar (`nscal` columns); the part of it in the output cells of each scalar (`nscal` columns).
 
 # About the `&other_options` namelist under `input.nml`
 
