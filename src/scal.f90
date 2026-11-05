@@ -26,6 +26,7 @@ module mod_scal
     character(len=1), dimension(0:1,3) :: cbc
     real(rp),         dimension(0:1,3) :: bc
     real(rp) :: source
+    real(rp) :: source_s  ! CHT: volumetric source in the solid
     logical  :: is_forced
     real(rp) :: scalf
     real(rp) :: f
@@ -406,7 +407,7 @@ module mod_scal
   end subroutine scal_cht
   !
   subroutine initialize_scalars(scalars,nscal,n,n_z)
-    use mod_param, only: alphai,iniscal,cbcscal,bcscal,ssource,is_sforced,scalf, &
+    use mod_param, only: alphai,iniscal,cbcscal,bcscal,ssource,ssource_s,is_sforced,scalf, &
                          is_impdiff,is_cht,ks_kf,cs_cf
     !
     ! initializes/allocates members of an array of `nscal` scalar derived types
@@ -432,6 +433,7 @@ module mod_scal
       scalars(iscal)%cbc       = cbcscal(:,:,iscal)
       scalars(iscal)%bc        = bcscal(:,:,iscal)
       scalars(iscal)%source    = ssource(iscal)
+      scalars(iscal)%source_s  = ssource_s(iscal)
       scalars(iscal)%is_forced = is_sforced(iscal)
       scalars(iscal)%scalf     = scalf(iscal)
       scalars(iscal)%is_cht    = is_cht(iscal)

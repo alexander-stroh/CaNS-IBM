@@ -450,7 +450,7 @@ module mod_rk
   !
   subroutine rk_scal(rkpar,n,dli,l,dzci,dzfi,grid_vol_ratio_f,alpha,dt,is_bound,u,v,w, &
                      is_forced,scalf,ssource,fluxo,dsdtrko,s,f,A_s,B_s,sw,sgrad,mask_s, &
-                     is_cht,alphas,cs_cf,cbcz,thx,thy,thz,phi)
+                     is_cht,alphas,cs_cf,cbcz,thx,thy,thz,phi,ssource_s)
 #if defined(_OPENACC)
     use mod_common_cudecomp, only: dsdtrk_t => work
 #endif
@@ -499,13 +499,16 @@ module mod_rk
     logical ,intent(in), dimension(0:,0:,0:), optional :: mask_s ! present if is_ibm
     real(rp) :: gain
     logical , intent(in), optional :: is_cht
-    real(rp), intent(in), optional :: alphas,cs_cf
+    real(rp), intent(in), optional :: alphas,cs_cf,ssource_s
+    real(rp) :: ssource_s_
     character(len=1), intent(in), dimension(0:1), optional :: cbcz
     real(rp), intent(in), dimension(0:,0:,0:), optional :: thx,thy,thz,phi
     logical  :: is_cht_
     !
     is_cht_ = .false.
     if(present(is_cht)) is_cht_ = is_cht
+    ssource_s_ = 0._rp
+    if(present(ssource_s)) ssource_s_ = ssource_s
     !
     factor1 = rkpar(1)*dt
     factor2 = rkpar(2)*dt
@@ -548,7 +551,7 @@ module mod_rk
       !
       ! all device loops of the CHT update work on non-optional dummy arguments (see `rk_scal_cht`)
       !
-      call rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas,cs_cf,ssource, &
+      call rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas,cs_cf,ssource,ssource_s_, &
                        is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f)
       return
     end if
@@ -659,7 +662,7 @@ module mod_rk
     end do
   end subroutine rk_scal
   !
-  subroutine rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas_in,cs_cf_in,ssource_in, &
+  subroutine rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas_in,cs_cf_in,ssource_in,ssource_s_in, &
                          is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f)
     !
     ! Runge-Kutta substep of a scalar with conjugate heat transfer (see `rk_scal`, `scal_cht`, `mod_cht`);
@@ -671,7 +674,7 @@ module mod_rk
     real(rp), intent(in), dimension(3) :: dli
     real(rp), intent(in), dimension(0:) :: dzci,dzfi
     real(rp), intent(in), dimension(:) :: grid_vol_ratio_f
-    real(rp), intent(in) :: factor1,factor2,factor12,alpha,alphas_in,cs_cf_in,ssource_in
+    real(rp), intent(in) :: factor1,factor2,factor12,alpha,alphas_in,cs_cf_in,ssource_in,ssource_s_in
     logical , intent(in) :: is_forced
     real(rp), intent(in) :: scalf
     real(rp), intent(in), dimension(0:,0:,0:) :: u,v,w,thx,thy,thz,phi
@@ -679,9 +682,9 @@ module mod_rk
     real(rp), intent(inout), dimension(:,:,:) :: dsdtrk,dsdtrkd,dsdtrko
     real(rp), intent(inout), dimension(0:,0:,0:) :: s
     real(rp), intent(out) :: f
-    real(rp) :: alphas,cs_cf,ss,f1,f2,f12,capi,mean
+    real(rp) :: alphas,cs_cf,ss,sss,f1,f2,f12,capi,mean
     integer :: i,j,k
-    alphas = alphas_in; cs_cf = cs_cf_in; ss = ssource_in
+    alphas = alphas_in; cs_cf = cs_cf_in; ss = ssource_in; sss = ssource_s_in
     f1 = factor1; f2 = factor2; f12 = factor12
     call scal_cht(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,alpha,alphas,cs_cf,u,v,w,thx,thy,thz,phi,s,dsdtrk,dsdtrkd)
     if(is_impdiff) then
@@ -697,7 +700,7 @@ module mod_rk
           do i=1,n(1)
             capi = 1._rp/(1._rp + (cs_cf-1._rp)*(1._rp-phi(i,j,k)))
             dsdtrkd(i,j,k) = f1*dsdtrk(i,j,k) + f2*dsdtrko(i,j,k) + &
-                             f12*(ss*phi(i,j,k)*capi + dsdtrkd(i,j,k))
+                             f12*((ss*phi(i,j,k) + sss*(1._rp-phi(i,j,k)))*capi + dsdtrkd(i,j,k))
             dsdtrko(i,j,k) = dsdtrk(i,j,k)
           end do
         end do
@@ -719,7 +722,7 @@ module mod_rk
         do j=1,n(2)
           do i=1,n(1)
             capi = 1._rp/(1._rp + (cs_cf-1._rp)*(1._rp-phi(i,j,k)))
-            s(i,j,k) = s(i,j,k) + f1*dsdtrk(i,j,k) + f2*dsdtrko(i,j,k) + f12*ss*phi(i,j,k)*capi
+            s(i,j,k) = s(i,j,k) + f1*dsdtrk(i,j,k) + f2*dsdtrko(i,j,k) + f12*(ss*phi(i,j,k) + sss*(1._rp-phi(i,j,k)))*capi
             dsdtrko(i,j,k) = dsdtrk(i,j,k)
           end do
         end do

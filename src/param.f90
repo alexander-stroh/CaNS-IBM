@@ -79,6 +79,7 @@ character(len=100), protected, allocatable, dimension(:)     :: iniscal
 character(len=1)  , protected, allocatable, dimension(:,:,:) :: cbcscal ! size (0:1,3,nscal)
 real(rp)          , protected, allocatable, dimension(:,:,:) ::  bcscal ! size (0:1,3,nscal)
 real(rp), protected, allocatable, dimension(:) :: ssource
+real(rp), protected, allocatable, dimension(:) :: ssource_s ! CHT: volumetric source in the solid (default 0)
 logical,protected :: const_scal ! if false, the mean-gradient source -u*scal_mean_grad is added
 real(rp), protected, allocatable, dimension(:) :: scal_mean_grad
 logical , protected, allocatable, dimension(:) :: is_sforced
@@ -205,7 +206,7 @@ contains
                      cbcscal_ibm,bcscal_ibm,bcscal_ibm_top,&
                      const_scal,scal_mean_grad,&
                      is_cht,ks_kf,cs_cf,&
-                     ssource, &
+                     ssource,ssource_s, &
                      is_sforced, &
                      scalf, &
                      is_boussinesq_buoyancy
@@ -372,12 +373,13 @@ contains
                  cbcscal(0:1,3,nscal),bcscal(0:1,3,nscal), &
                  cbcscal_ibm(nscal),bcscal_ibm(nscal),bcscal_ibm_top(nscal),&
                  is_cht(nscal),ks_kf(nscal),cs_cf(nscal),&
-                 ssource(nscal),is_sforced(nscal),scalf(nscal),scal_mean_grad(nscal))
+                 ssource(nscal),ssource_s(nscal),is_sforced(nscal),scalf(nscal),scal_mean_grad(nscal))
         !
         ! set default values
         !
         beta          = 0.
         ssource(:)    = 0.
+        ssource_s(:)  = 0.
         is_sforced(:) = .false.
         scalf(:)      = 0.
         cbcscal_ibm(:) = "D"

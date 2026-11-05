@@ -999,7 +999,7 @@ program cans
           call rk_scal(rkcoeff(:,irk),n,dli,l,dzci,dzfi,grid_vol_ratio_f,s%alpha,dt,is_bound,u,v,w, &
                        s%is_forced,s%scalf,s%source,s%fluxo,s%dsdtrko,s%val,s%f,A_s,B_s, &
                        swz(:,iscal),scal_mean_grad(iscal),mask_s, &
-                       is_cht=s%is_cht,alphas=s%alphas,cs_cf=s%cs_cf,cbcz=s%cbc(:,3), &
+                       is_cht=s%is_cht,alphas=s%alphas,cs_cf=s%cs_cf,ssource_s=s%source_s,cbcz=s%cbc(:,3), &
                        thx=thx,thy=thy,thz=thz,phi=phi_cht)
         else
         if(is_ibm) then
