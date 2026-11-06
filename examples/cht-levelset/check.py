@@ -8,7 +8,7 @@ slab    : last checkpoint against the exact steady solution (Poiseuille flow; in
           interface T_i = q d H/k_s): max |T - T_ex|/T_ex(centre) per scalar and max |u - u_ex|/U_max
 wavy    : last checkpoint: bulk velocity of the fluid and mean temperature of the fluid and of the solid per scalar
 cylinder: t >= 200: bulk velocity, drag and lift coefficients (C = 2 F/(U_b^2 D), the force of data/ibm_force.out minus
-          the driving force on the solid volume), Strouhal number from the lift; mean T (data/forcing_s_*.out)
+          the driving force on the solid volume), Strouhal number from the lift; mean fluid T (data/forcing_s_*.out, divided by the fluid fraction)
 """
 import re, sys
 from pathlib import Path
@@ -63,7 +63,7 @@ def wavy(case):
 def cylinder(case, t0=200., D=1.):
     p = nml(case); (nx, ny, nz), (lx, ly, lz) = p['ng'], p['l']
     a, b = np.loadtxt(case/'data'/'ibm_force.out'), np.loadtxt(case/'data'/'forcing.out')
-    vs = (np.fromfile(case/'data'/'sdfp.bin') < 0).mean()*lx*lz           # solid area of the x-z plane
+    sf = (np.fromfile(case/'data'/'sdfp.bin') < 0).mean(); vs = sf*lx*lz   # solid fraction, solid area of the x-z plane
     t = a[:, 0]; m = t >= t0
     ub = np.interp(t, b[:, 0], b[:, 4])
     fx, fz = a[:, 4]*lx*lz - p['bforce']*vs, a[:, 6]*lx*lz                  # per unit span
@@ -77,7 +77,7 @@ def cylinder(case, t0=200., D=1.):
           f'C_L amplitude = {0.5*(cl.max() - cl.min()):.4f}, St = {st:.4f}')
     for i, ks in enumerate(p['ks']):
         f = np.loadtxt(case/'data'/f'forcing_s_{i + 1:03d}.out')
-        print(f'  scalar {i + 1} (k_s/k_f = {ks:g}): mean T = {f[f[:, 0] >= t0, 2].mean():.4f}')
+        print(f'  scalar {i + 1} (k_s/k_f = {ks:g}): mean fluid T = {f[f[:, 0] >= t0, 2].mean()/(1 - sf):.4f}')
 
 
 if __name__ == '__main__':

@@ -77,12 +77,12 @@ cylinder volume):
 
 ```
 cylinder, t = 200 ... 400.021: U_b = 1.0007, Re_D = 80.06, C_D = 3.4504, C_D amplitude = 0.2711, C_L amplitude = 3.1511, St = 0.2773
-  scalar 1 (k_s/k_f = 1): mean T = 55.3024
-  scalar 2 (k_s/k_f = 10): mean T = 55.2980
-  scalar 3 (k_s/k_f = 100): mean T = 55.2960
-  scalar 4 (k_s/k_f = 0.1): mean T = 55.2823
-  scalar 5 (k_s/k_f = 1): mean T = 55.3605
-  scalar 6 (k_s/k_f = 1): mean T = 54.1560
+  scalar 1 (k_s/k_f = 1): mean fluid T = 56.2546
+  scalar 2 (k_s/k_f = 10): mean fluid T = 56.2501
+  scalar 3 (k_s/k_f = 100): mean fluid T = 56.2481
+  scalar 4 (k_s/k_f = 0.1): mean fluid T = 56.2342
+  scalar 5 (k_s/k_f = 1): mean fluid T = 56.3137
+  scalar 6 (k_s/k_f = 1): mean fluid T = 55.0885
 ```
 
 At D/Δx = 64 the same set-up agrees with OpenFOAM at D/Δx = 64 within 0.5 % in C<sub>D</sub>, the C<sub>D</sub> and C<sub>L</sub>
@@ -90,10 +90,63 @@ amplitudes, St and U<sub>b</sub>; the mean temperatures are 0.7–0.9 % higher t
 (the mean T is still rising slowly at t = 400). To run it finer, change `ng` in `cylinder/input.nml`
 (D/Δx = 32: `384, 4, 128`, `l(2) = 0.125`) and rerun `setup.py cylinder`.
 
+## OpenFOAM reference cases
+
+`openfoam/` generates the body-fitted counterparts of the three cases for OpenFOAM v2412 (ESI): one region per
+material (`chtMultiRegionSimpleFoam` for the steady `slab` and `wavy`, `chtMultiRegionFoam` for the cylinder), coupled
+by `turbulentTemperatureCoupledBaffleMixed`. The physics is the same as in CaNS: ρ = c<sub>p</sub> = 1, μ = ν, Pr = 1,
+constant pressure gradient and q = 1 in the fluid (`fvOptions`), T = 0 at z = 0 and 4 (OpenFOAM uses T + 300).
+The mesh is 2D (one cell in y, `empty`); the slab and wavy meshes have the solid/fluid interfaces as block boundaries
+(splines for the wavy walls), the cylinder an O-grid in a 2D × 2D box with Δx = D/ppd outside it.
+
+```
+cd openfoam
+python3 make_cases.py slab          # slab/n064/K<k_s/k_f>_C1/        (optional: cells in z, default 64)
+python3 make_cases.py wavy          # wavy/n032/K<k_s/k_f>_C1/        (cells in x and z, default 32)
+python3 make_cases.py cylinder      # cylinder/ppd016/K<k>_C<c>/      (D/dx, default 16; > 16 runs in parallel)
+./slab/n064/K1_C1/Allrun            # one run per folder; mesh, regions, solver, cell centres and volumes
+python3 extract.py slab             # the same quantities as ../check.py, for every run of the mesh
+```
+
+`Allrun` sources `$FOAM_BASHRC` (default `/usr/lib/openfoam/openfoam2412/etc/bashrc`) unless OpenFOAM is already
+loaded. The steady cases depend only on k<sub>s</sub>/k<sub>f</sub> (four runs, C = 1); the cylinder has the six pairs of the
+CaNS example and starts from the same initial flow (`set_u0.py`, called by `Allrun`), with the pressure work
+switched off in the energy equation (`dpdt no`), as in the CaNS scalar equation. Run time on one core: slab 4.5 min,
+wavy 50 min, cylinder 70 min per run. `make_cases.py`, `extract.py` and `set_u0.py` need only NumPy.
+
+Results of `extract.py` on these meshes:
+
+```
+slab K1_C1,   iteration 100000: T_centre =  147.9800 (exact  147.9331), max |T - T_ex|/T_ex(centre) = 3.17e-04, max |u - u_ex|/U_max = 9.78e-04
+slab K10_C1,  iteration 100000: T_centre =   58.0160 (exact   57.9691), max |T - T_ex|/T_ex(centre) = 8.09e-04, max |u - u_ex|/U_max = 9.78e-04
+slab K100_C1, iteration 100000: T_centre =   49.0196 (exact   48.9727), max |T - T_ex|/T_ex(centre) = 9.58e-04, max |u - u_ex|/U_max = 9.78e-04
+slab K0.1_C1, iteration 100000: T_centre = 1047.6200 (exact 1047.5731), max |T - T_ex|/T_ex(centre) = 4.48e-05, max |u - u_ex|/U_max = 9.78e-04
+
+wavy K1_C1,   iteration 100000: U_b = 0.19567, mean T fluid  121.9491, solid   51.8175
+wavy K10_C1,  iteration 100000: U_b = 0.19567, mean T fluid   34.2153, solid    6.0238
+wavy K100_C1, iteration 100000: U_b = 0.19567, mean T fluid   23.4529, solid    0.6215
+wavy K0.1_C1, iteration 100000: U_b = 0.19567, mean T fluid  860.1985, solid  449.7715
+
+cylinder K1_C1,   t = 200 ... 400: U_b = 1.0038, C_D = 3.4057, C_D amplitude = 0.2765, C_L amplitude = 3.3200, St = 0.2752, mean fluid T = 55.7493
+cylinder K10_C1,  ...                                                                                           mean fluid T = 55.7436
+cylinder K100_C1, ...                                                                                           mean fluid T = 55.7410
+cylinder K0.1_C1, ...                                                                                           mean fluid T = 55.7309
+cylinder K1_C0.1, ...                                                                                           mean fluid T = 55.8071
+cylinder K1_C10,  ...                                                                                           mean fluid T = 54.6029
+```
+
+(the flow quantities of the cylinder are the same in all six runs; the slab mesh has 16 cells per slab and 32 in
+the fluid, so the cell centres and the exact values differ slightly from CaNS). On these coarse grids CaNS and
+OpenFOAM differ by about 1–1.5 % in the wavy case (U<sub>b</sub>, mean fluid T) and by up to 5 % in the cylinder's
+C<sub>L</sub> amplitude; the differences shrink with the grid (see above). For the wavy k<sub>s</sub>/k<sub>f</sub> = 0.1 case compare
+with a CaNS run continued to t ≈ 9000. Finer grids: `make_cases.py wavy 64`, `make_cases.py cylinder 32` and the
+corresponding `ng` in the CaNS inputs.
+
 ## Outputs used
 
 * `data/fld_*.bin` (checkpoint at the end of the run), `data/forcing.out` (bulk velocity, column 5),
-  `data/forcing_s_<n>.out` (mean of scalar n, column 3), `data/ibm_force.out` (IB force per unit box volume, x in
+  `data/forcing_s_<n>.out` (column 3: sum of scalar n over the fluid divided by the box volume; `check.py` divides by
+  the fluid fraction), `data/ibm_force.out` (IB force per unit box volume, x in
   column 5, z in column 7): see [`docs/INFO_INPUT.md`](../../docs/INFO_INPUT.md).
 * The per-cell wall outputs (`FV-fric`, `FV-heat`, `wall_heat.out`) are off (`ibm_iout_wall = 0`); set
   `ibm_iout_wall` > 0 to write them.
