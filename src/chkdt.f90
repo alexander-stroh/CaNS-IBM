@@ -7,7 +7,7 @@
 module mod_chkdt
   use mpi
   use mod_common_mpi, only:ierr
-  use mod_param     , only:is_impdiff,is_impdiff_1d
+  use mod_param     , only:is_impdiff,is_impdiff_1d,ibm_updiss,ibm_updiss_mode
   use mod_types
   implicit none
   private
@@ -70,6 +70,12 @@ module mod_chkdt
     !$acc wait(1)
     call MPI_ALLREDUCE(MPI_IN_PLACE,dti,1,MPI_REAL_RP,MPI_MAX,MPI_COMM_WORLD,ierr)
     if(dti < epsilon(0._rp)) dti = 1.
+    !
+    ! RK3 limit of central advection plus the upwind dissipation (1D von Neumann analysis; it
+    ! carries over to the sum over the directions in dti):
+    ! unchanged up to c = 1.087, then the advective time step scales with 1.087/c
+    !
+    if(trim(ibm_updiss_mode) /= 'none' .and. ibm_updiss > 1.087_rp) dti = dti*ibm_updiss/1.087_rp
     if(is_impdiff .and. .not.is_impdiff_1d) then
       dtmax = sqrt(3.)/dti
     else

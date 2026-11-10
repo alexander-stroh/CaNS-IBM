@@ -20,7 +20,8 @@ module mod_sanity
   use mod_initsolver, only: initsolver
   use mod_param     , only: ipencil_axis,is_impdiff,is_impdiff_1d,is_poisson_pcr_tdma,small,adv_form, &
                             is_ibm,nscal,cbcscal_ibm,bulk_vel_def, &
-                            ibm_shape,use_hmap,ibm_direction,amp_l,phase_l,ibm_proj
+                            ibm_shape,use_hmap,ibm_direction,amp_l,phase_l,ibm_proj, &
+                            ibm_updiss_mode,ibm_updiss,ibm_updiss_ncell,ibm_updiss_ntaper
 #if !defined(_OPENACC)
   use mod_solver    , only: solver
 #else
@@ -69,8 +70,8 @@ module mod_sanity
       if(myid == 0)  print*, 'ERROR: `is_ibm = T` with implicit diffusion requires `is_impdiff_1d = T` &
                              &(the 3D FFT-based Helmholtz solver cannot hold the IB term).'; call abortit
     end if
-    if(.not.any(trim(ibm_shape) == ['macdonald','sinusoid '])) then
-      if(myid == 0)  print*, 'ERROR: `ibm_shape` must be either `macdonald` or `sinusoid`.'; call abortit
+    if(.not.any(trim(ibm_shape) == ['macdonald','sinusoid ','cones    '])) then
+      if(myid == 0)  print*, 'ERROR: `ibm_shape` must be `macdonald`, `sinusoid` or `cones`.'; call abortit
     end if
     if(is_ibm .and. .not.use_hmap .and. trim(ibm_shape) == 'macdonald') then
       block
@@ -96,6 +97,19 @@ module mod_sanity
     end if
     if(trim(ibm_proj) /= 'none' .and. .not.is_ibm) then
       if(myid == 0)  print*, 'ERROR: `ibm_proj /= ''none''` requires `is_ibm = T`.'; call abortit
+    end if
+    if(.not.any(trim(ibm_updiss_mode) == ['none','body'])) then
+      if(myid == 0)  print*, 'ERROR: `ibm_updiss_mode` must be `none` or `body`.'; call abortit
+    end if
+    if(trim(ibm_updiss_mode) /= 'none') then
+      if(ibm_updiss <= 0._rp .or. ibm_updiss_ncell < 0 .or. ibm_updiss_ntaper < 0 .or. &
+         ibm_updiss_ncell+ibm_updiss_ntaper < 1) then
+        if(myid == 0)  print*, 'ERROR: `ibm_updiss` must be > 0, `ibm_updiss_ncell` and &
+                                       &`ibm_updiss_ntaper` >= 0, with a sum >= 1.'; call abortit
+      end if
+      if(.not.is_ibm) then
+        if(myid == 0)  print*, 'ERROR: `ibm_updiss_mode /= ''none''` requires `is_ibm = T`.'; call abortit
+      end if
     end if
     if(is_ibm .and. nscal > 0) then
       if(any(cbcscal_ibm(1:nscal) /= 'D')) then

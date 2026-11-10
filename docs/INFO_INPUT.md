@@ -392,11 +392,16 @@ ibm_hch      = -1.
 bulk_vel_def = 'superficial'
 ibm_proj     = 'none'
 ibm_iout_wall = -1
+ibm_updiss_mode = 'none'
+ibm_updiss   = 1.
+ibm_updiss_ncell = 2
+ibm_updiss_ntaper = 0
 /
 ```
 `ibm_shape` selects the analytic wall shape (with `&hmap use_hmap = F`). For a wall normal to direction `t` on side `s` (`ibm_direction(s,t) = T`), with in-plane directions `i = mod(t,3)+1` and `ii = mod(t+1,3)+1`, and the bottom wall at `l_0(0,t) + h`, the top wall at `l_0(1,t) - h`:
 * `'macdonald'` (default): `h = amp_l(s,i)*(1 +/- cos(2 pi n_wave(s,i) x_i/l_i)*cos(2 pi n_wave(s,ii) x_ii/l_ii))` (`+` for the bottom wall); `amp_l(s,ii)` and `phase_l` are ignored, and a warning is printed if they are set.
 * `'sinusoid'`: `h = sum over d = i, ii of amp_l(s,d)/2*(1 + sin(2 pi n_wave(s,d) x_d/l_d + phase_l(s,d)))`.
+* `'cones'`: staggered truncated cones as in Theobald et al. (WCCM-ECCOMAS 2020): height `amp_l(s,i)`, base radius `1.25 amp_l(s,i)`, flank slope 55 degrees; `n_wave(s,i) x n_wave(s,ii)` units of size `l_i/n_wave(s,i) x l_ii/n_wave(s,ii)`, each with two cones centred at (1/4, 1/4) and (3/4, 3/4) of the unit.
 
 The roughness height range printed at start-up (`hmin`, `hmax`) is sampled from the actual wall shape on a grid 4 times finer than the mesh in x and y.
 
@@ -409,6 +414,13 @@ The roughness height range printed at start-up (`hmin`, `hmax`) is sampled from 
 * `'damped'`: the correction is divided by the IB coefficient `A` at the non-solid points, as the exact IB scheme integrates a pressure-gradient impulse, and the solid points are not corrected, so their velocity stays exactly zero. The velocity is then divergence free only up to a residual in the cut cells, of the same size as the divergence that `'none'` creates when it zeroes the solid points, so the divergence check does not abort on it. The fluid bulk velocity is no longer conserved by the correction; with bulk forcing it is restored at the next stage. The cost is that of `'none'`.
 
 In tests (turbulent channel over the MacDonald wall, 64^3) the two options give the same errors and temporal order (2 at the band points) to three digits; `'damped'` removes only the solid leakage. A lagged pre-compensation of the predictor with the previous pressure correction (Kim-Moin type) was tested and is unstable: the zeroing of the solid points at each stage start already acts as such a pre-compensation.
+
+`ibm_updiss_mode` adds, near the immersed body, the dissipative part of third-order upwind advection, `-d/dx(c phi |u| dx^3/12 d^3q/dx^3) - d/dy(c phi |v| dy^3/12 d^3q/dy^3) - d/dz(c phi |w| dz^3/12 d^3q/dz^3)` for each velocity component `q`, in flux form (momentum conservative; in z with undivided differences on the stretched grid). The central advection is non-dissipative, and at cell Peclet numbers well above 2 the sharp IB makes it develop grid-scale (2 dx) wiggles upstream of the body, visible in the mean wall-normal velocity and in `u'w'`; the term damps them. `c = ibm_updiss`; for `c > 1.087` the advective time step is reduced by `1.087/c` (RK3 stability). `ibm_updiss_mode` is:
+
+* `'none'`: no term (default); nothing is allocated or computed.
+* `'body'`: the term acts with the weight `phi` in [0,1] of a layer around the immersed wall, grown from the IB mask of each velocity component: level 1 are the fluid points with a solid neighbour (the points carrying IB coefficients), level `m` the fluid points next to level `m-1`, neighbours counted in all 26 directions so that the layer is isotropic in grid cells. `phi = 1` up to level `ibm_updiss_ncell`, then a cosine taper over a further `ibm_updiss_ntaper` levels (solid points: 1). The layer depends neither on the geometry nor on the wall orientation, and shrinks with the grid. The term is computed only on the layer points.
+
+With scalars (`nscal > 0`) the same term, with the layer grown from the scalar mask and the face velocities as advection velocities, is added to the scalar equations. Damping only the momentum would leave the scalar with the central advection next to the sharp IB and lower the heat transfer: in the MacDonald et al. (2019) case (`examples/macdonald-eggcarton-roughness`) `Ch` drops by 0.5 % with the momentum term alone and is unchanged (-0.1 %, within the statistical uncertainty) with both; drag and `Delta U+` are unchanged in both cases. The default `ibm_updiss_ncell = 2` damps the wiggles upstream of the truncated cones almost as well as 3 (high-pass rms of the mean wall-normal velocity 0.069 vs 0.066, 0.122 without the term).
 
 `ibm_iout_wall` is the interval, in time steps, of the per-point wall outputs `fric-*`, `pressure*`, `FV-fric_*` and `ibm_wall_stress_*` below. A negative value (default) uses `iout1d`; `0` switches them off. The plane statistics `turb_stats_*` stay at `iout1d`. On fine grids the per-cell files are large (one line per cut cell), so a larger interval than `iout1d` keeps the statistics frequent without them.
 
