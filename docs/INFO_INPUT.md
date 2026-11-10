@@ -401,6 +401,7 @@ ibm_updiss_ntaper = 0
 `ibm_shape` selects the analytic wall shape (with `&hmap use_hmap = F`). For a wall normal to direction `t` on side `s` (`ibm_direction(s,t) = T`), with in-plane directions `i = mod(t,3)+1` and `ii = mod(t+1,3)+1`, and the bottom wall at `l_0(0,t) + h`, the top wall at `l_0(1,t) - h`:
 * `'macdonald'` (default): `h = amp_l(s,i)*(1 +/- cos(2 pi n_wave(s,i) x_i/l_i)*cos(2 pi n_wave(s,ii) x_ii/l_ii))` (`+` for the bottom wall); `amp_l(s,ii)` and `phase_l` are ignored, and a warning is printed if they are set.
 * `'sinusoid'`: `h = sum over d = i, ii of amp_l(s,d)/2*(1 + sin(2 pi n_wave(s,d) x_d/l_d + phase_l(s,d)))`.
+* `'cones'`: staggered truncated cones as in Theobald et al. (WCCM-ECCOMAS 2020): height `amp_l(s,i)`, base radius `1.25 amp_l(s,i)`, flank slope 55 degrees; `n_wave(s,i) x n_wave(s,ii)` units of size `l_i/n_wave(s,i) x l_ii/n_wave(s,ii)`, each with two cones centred at (1/4, 1/4) and (3/4, 3/4) of the unit.
 
 The roughness height range printed at start-up (`hmin`, `hmax`) is sampled from the actual wall shape on a grid 4 times finer than the mesh in x and y.
 

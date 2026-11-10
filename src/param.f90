@@ -126,7 +126,7 @@ real(rp), protected   :: l_0(0:1,3)=0._rp
 integer, protected    :: n_wave(0:1,3)=0._rp
 real(rp), protected   :: amp_l(0:1,3)=0._rp
 real(rp), protected   :: phase_l(0:1,3)=0._rp
-character(len=16), protected :: ibm_shape = 'macdonald' ! analytic wall shape: 'macdonald' or 'sinusoid'
+character(len=16), protected :: ibm_shape = 'macdonald' ! analytic wall shape: 'macdonald', 'sinusoid' or 'cones'
 real(rp), protected   :: ibm_hch = -1._rp ! reference half height for the rough-wall grid (gtype = 5)
 character(len=16), protected :: bulk_vel_def = 'superficial' ! IBM bulk velocity: 'superficial' or 'intrinsic'
 character(len=16), protected :: ibm_proj = 'none' ! IB-aware velocity correction: 'none' or 'damped'
