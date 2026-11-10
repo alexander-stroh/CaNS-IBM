@@ -7,19 +7,22 @@
 module mod_updiss
   !
   ! upwind dissipation near the immersed body (`ibm_updiss_mode /= 'none'`):
-  ! the dissipative part of third-order upwind advection (for the velocity components and,
-  ! with `ibm_updiss_scal`, for the scalars),
+  ! the dissipative part of third-order upwind advection (for the velocity components and the
+  ! scalars),
   !   dq/dt += -d/dx( c*phi*|U|*dx**3/12*d3q/dx3 ) - d/dy( c*phi*|V|*dy**3/12*d3q/dy3 )
   !            -d/dz( c*phi*|W|*dz**3/12*d3q/dz3 ),
   ! written in flux form (momentum conservative, phi averaged to the flux faces); in z with
   ! undivided differences on the stretched grid. It damps the grid-scale (2*dx) wiggles that
   ! the non-dissipative central advection develops upstream of a sharp immersed body.
+  ! The scalars get the term too: damping only the momentum lowers the heat transfer of a
+  ! rough wall (MacDonald et al. 2019 case: Ch -0.5 %, -0.1 % with the scalars damped too).
   ! The weight phi in [0,1] ('body') is a layer around the immersed wall, grown from the IB
-  ! mask of each velocity component (and of the scalar): level 1 are the fluid points with a solid neighbour (the
-  ! points with IB coefficients), level m the fluid points next to level m-1 (neighbours in
-  ! all 26 directions, so that the layer is isotropic in grid cells). phi = 1 up to level
-  ! ibm_updiss_ncell, then a cosine taper over a further ibm_updiss_ntaper levels; phi = 1 in
-  ! the solid. It is independent of the geometry and of the wall orientation
+  ! mask of each velocity component (and of the scalar): level 1 are the fluid points with a
+  ! solid neighbour (the points with IB coefficients), level m the fluid points next to level
+  ! m-1 (neighbours in all 26 directions, so that the layer is isotropic in grid cells).
+  ! phi = 1 up to level ibm_updiss_ncell, then a cosine taper over a further
+  ! ibm_updiss_ntaper levels; phi = 1 in the solid. It is independent of the geometry and of
+  ! the wall orientation
   !
   ! the term is evaluated only on compact lists of the points where it acts and, for the
   ! second differences, of their neighbours
@@ -27,7 +30,7 @@ module mod_updiss
   use mpi
   use mod_bound   , only: boundp
   use mod_common_mpi, only: myid,ierr
-  use mod_param   , only: ibm_updiss,ibm_updiss_ncell,ibm_updiss_ntaper,ibm_updiss_scal
+  use mod_param   , only: ibm_updiss,ibm_updiss_ncell,ibm_updiss_ntaper,nscal
   use mod_types
   implicit none
   private
@@ -45,7 +48,7 @@ module mod_updiss
   contains
   subroutine updiss_init(n,dl,dzc,dzf,mask_u,mask_v,mask_w,mask_s,cbcpre,bcpre,nb,is_bound)
     !
-    ! weights at the u, v and w points (and at the cell centres, with `ibm_updiss_scal`;
+    ! weights at the u, v and w points (and at the cell centres, with scalars;
     ! halos included) and the point lists;
     ! the halos of the second differences use the pressure boundary conditions
     !
@@ -68,7 +71,7 @@ module mod_updiss
     is_bound_g(:,:) = is_bound(:,:); dl_g(:) = dl(:)
     allocate(dzc_g(0:n(3)+1),dzci_g(0:n(3)+1),dzfi_g(0:n(3)+1))
     dzc_g(:) = dzc(0:n(3)+1); dzci_g(:) = 1._rp/dzc(0:n(3)+1); dzfi_g(:) = 1._rp/dzf(0:n(3)+1)
-    nc = merge(4,3,ibm_updiss_scal)
+    nc = merge(4,3,nscal > 0)
     allocate(phi(0:n(1)+1,0:n(2)+1,0:n(3)+1,nc))
     phi(:,:,:,:) = 0._rp
     !
