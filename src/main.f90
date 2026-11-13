@@ -46,6 +46,7 @@ program cans
   use mod_load           , only: load_one
   use mod_mom            , only: bulk_forcing
   use mod_rk             , only: rk,rk_scal,calc_a_b
+  use mod_updiss         , only: updiss_init
   use mod_timer          , only: timer_tic,timer_toc
   use mod_output         , only: out0d,gen_alias,out1d,out1d_chan,out1d_chan_ibm,out2d,out3d, &
                                  write_log_output,write_visu_2d,write_visu_3d
@@ -84,7 +85,7 @@ program cans
                                  amp_l,            &
                                  phase_l,          &
                                  bulk_vel_def,     &
-                                 ibm_proj,ibm_iout_wall,mproj_tol,mproj_maxit, &
+                                 ibm_proj,ibm_iout_wall,mproj_tol,mproj_maxit,ibm_updiss_mode, &
                                  ibm_hch,          &
                                  geometry,sdf_file,dump_ibm_geometry, &
                                  use_hmap,         &
@@ -96,10 +97,11 @@ program cans
   use mod_solve_helmholtz, only: solve_helmholtz,solve_helmholtz_ibm,rhs_bound
   use mod_cht            , only: cht_init
   use mod_ibm_sdf        , only: sdf_read,sdf_staggered,sdf_mask,set_ibm_2nd_sdf,calc_grad_dist_sdf, &
-                                 set_cht_geometry_sdf,sdf_interface_density
+                                 set_cht_geometry_sdf,sdf_interface_density,set_cht_face_tensor,cht_th_tensor,cht_kdiff, &
+                                 set_cht_face_o2
   use mod_ibm_damp       , only: ibm_damp_init
   use mod_param          , only: is_ibm_damp,ibm_damp_d
-  use mod_param          , only: qw_ibm,qw_ibm_eps
+  use mod_param          , only: qw_ibm,qw_ibm_eps,cht_kface,cht_kcross_stab,cht_kcross_scheme,cht_kcross_cfl
 #if !defined(_OPENACC)
   use mod_solver         , only: solver
 #else
@@ -150,6 +152,7 @@ program cans
   type(rhs_bound) :: rhsbu,rhsbv,rhsbw
   !
   real(rp) :: dt,dti,dt_cfl,time,dtrk,dtrki,divtot,divmax
+  real(rp) :: dtmax_kcr = huge(1._rp) ! time-step limit of the explicit off-diagonal CHT term (`cht_kface = 'tensor_full'`)
   real(rp) :: velmax_solid(3),divtot_m,divmax_m,ubulk_fl
   logical  :: is_ibm_force,is_ibm_map,is_first_stage,is_zero_vel
   real(rp) :: mp_bn,mp_rn,mp_rz,mp_rzn,mp_al ! masked projection (PCG) scalars
@@ -247,6 +250,13 @@ program cans
 !*******CHT*********!
   ! sub-cell geometry of the solid for the scalars with conjugate heat transfer (see `set_cht_geometry`)
   real(rp), allocatable, dimension(:,:,:) :: thx,thy,thz,phi_cht
+  ! `cht_kface = 'tensor'`: equivalent segment fractions of the tensor face conductivity, one set per CHT scalar
+  real(rp), allocatable, dimension(:,:,:,:) :: thxt,thyt,thzt
+  ! `cht_kface = 'tensor_full'`: off-diagonal face conductivities (k_series-k_parallel)*n_d*n_e, one set per CHT scalar
+  ! (`'tensor_o2'`: those of the second-order closure, see `set_cht_face_o2`)
+  real(rp), allocatable, dimension(:,:,:,:,:) :: kcr
+  ! `cht_kface = 'tensor_full'` with implicit diffusion: stabilized face fractions of the line solvers (set-up only)
+  real(rp), allocatable, dimension(:,:,:,:) :: thxs,thys,thzs
   logical  :: is_cht_any
   real(rp) :: alpha_max_eff
   ! interfacial heat flux of CHT scalars (`qw_ibm`): interface area per unit volume at the cell centres
@@ -671,6 +681,14 @@ program cans
     ! column-integrated IB force, also needed by the IB force output (`iout0d`) with `geometry = 'sdf'`
     allocate(imp_map(n(1),n(2),2))
     !$acc enter data create(imp_map)
+    if(trim(ibm_updiss_mode) /= 'none') then
+      if(nscal > 0) then
+        call updiss_init(n,dl,dzc,dzf,mask_u,mask_v,mask_w,mask_s,cbcpre,bcpre,nb,is_bound, &
+                         any(.not.scalars(:)%is_cht),is_cht_any)
+      else
+        call updiss_init(n,dl,dzc,dzf,mask_u,mask_v,mask_w,mask_s,cbcpre,bcpre,nb,is_bound)
+      end if
+    end if
   endif
   if(is_ibm)then
     print*, "***IBM coefficients are deploying***"
@@ -816,8 +834,168 @@ program cans
                             hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha,thx,thy,thz,phi_cht)
     endif
     !$acc enter data copyin(thx,thy,thz,phi_cht)
+    if(is_cht_any .and. cht_kface(1:6) == 'tensor') then
+      !
+      ! tensor face conductivity: face area fractions and normal weights from the level set, then per CHT
+      ! scalar (conductivity ratio) the equivalent segment fraction, used by all its CHT kernels
+      !
+      block
+        real(rp), allocatable, dimension(:,:,:) :: ax,ay,az,wx,wy,wz
+        real(rp), allocatable, dimension(:,:,:,:) :: pn
+        real(rp), allocatable, dimension(:,:,:,:,:) :: fn
+        real(rp) :: rf,rs,sx,sy,sz
+        integer :: nset,i,j,k
+        logical :: is_full,is_o2
+        is_o2   = trim(cht_kface) == 'tensor_o2'
+        is_full = trim(cht_kface) == 'tensor_full' .or. is_o2 ! with off-diagonal face conductivities
+        allocate(ax,ay,az,wx,wy,wz,mold=thx)
+        if(is_o2) then
+          allocate(fn(0:n(1)+1,0:n(2)+1,0:n(3)+1,3,3))
+          call set_cht_face_tensor(n,dl,zc,dzf,ps_sdf,ax,ay,az,wx,wy,wz,fn=fn)
+        else if(is_full) then
+          allocate(pn(0:n(1)+1,0:n(2)+1,0:n(3)+1,6))
+          call set_cht_face_tensor(n,dl,zc,dzf,ps_sdf,ax,ay,az,wx,wy,wz,pn)
+          !
+          ! no tangential flux through the domain boundaries along z
+          !
+          if(lo(3) == 1    ) pn(:,:,0   ,5:6) = 0._rp
+          if(hi(3) == ng(3)) pn(:,:,n(3),5:6) = 0._rp
+        else
+          call set_cht_face_tensor(n,dl,zc,dzf,ps_sdf,ax,ay,az,wx,wy,wz)
+        end if
+        nset = count(scalars(:)%is_cht)
+        allocate(thxt(0:n(1)+1,0:n(2)+1,0:n(3)+1,nset),thyt(0:n(1)+1,0:n(2)+1,0:n(3)+1,nset), &
+                 thzt(0:n(1)+1,0:n(2)+1,0:n(3)+1,nset))
+        if(is_full) allocate(kcr(0:n(1)+1,0:n(2)+1,0:n(3)+1,6,nset))
+        nset = 0
+        do iscal=1,nscal
+          if(.not.scalars(iscal)%is_cht) cycle
+          nset = nset+1; scalars(iscal)%iset = nset
+          rf = 1._rp/scalars(iscal)%alpha; rs = 1._rp/scalars(iscal)%alphas
+          if(is_o2) then
+            call set_cht_face_o2(n,dzc,[lo(3) == 1,hi(3) == ng(3)],thx,thy,thz,ax,ay,az,fn,rf,rs, &
+                                 thxt(:,:,:,nset),thyt(:,:,:,nset),thzt(:,:,:,nset),kcr(:,:,:,:,nset))
+            cycle
+          end if
+          do k=0,n(3)+1
+            do j=0,n(2)+1
+              do i=0,n(1)+1
+                thxt(i,j,k,nset) = cht_th_tensor(thx(i,j,k),ax(i,j,k),wx(i,j,k),rf,rs)
+                thyt(i,j,k,nset) = cht_th_tensor(thy(i,j,k),ay(i,j,k),wy(i,j,k),rf,rs)
+                thzt(i,j,k,nset) = cht_th_tensor(thz(i,j,k),az(i,j,k),wz(i,j,k),rf,rs)
+                if(is_full) then
+                  kcr(i,j,k,1:2,nset) = pn(i,j,k,1:2)*cht_kdiff(thx(i,j,k),ax(i,j,k),rf,rs)
+                  kcr(i,j,k,3:4,nset) = pn(i,j,k,3:4)*cht_kdiff(thy(i,j,k),ay(i,j,k),rf,rs)
+                  kcr(i,j,k,5:6,nset) = pn(i,j,k,5:6)*cht_kdiff(thz(i,j,k),az(i,j,k),rf,rs)
+                end if
+              end do
+            end do
+          end do
+        end do
+        deallocate(ax,ay,az,wx,wy,wz)
+        if(allocated(pn)) deallocate(pn)
+        if(allocated(fn)) deallocate(fn)
+        if(is_full .and. is_impdiff .and. trim(cht_kcross_scheme) /= 'explicit' .and. cht_kcross_stab > 0._rp) then
+          !
+          ! stabilized face fractions of the line solvers (left-hand side of the factorized scheme only):
+          ! the off-diagonal flux through a face, K*(dT/dn)*<dT/dt>, with <dT/dt> the mean of four tangential
+          ! face gradients, is bounded by |K|/2*((dT/dn)**2 + <dT/dt>**2) (Cauchy-Schwarz), so the face gets
+          ! |K|/2 and each of the four tangential faces |K|/8, times cht_kcross_stab; the face conductivity
+          ! k = 1/(th*rf + (1-th)*rs) becomes k + s, i.e. th = (1/(k+s) - rs)/(rf - rs)
+          !
+          allocate(thxs,thys,thzs,mold=thxt)
+          thxs(:,:,:,:) = thxt(:,:,:,:); thys(:,:,:,:) = thyt(:,:,:,:); thzs(:,:,:,:) = thzt(:,:,:,:)
+          nset = 0
+          do iscal=1,nscal
+            if(.not.scalars(iscal)%is_cht) cycle
+            nset = nset+1
+            rf = 1._rp/scalars(iscal)%alpha; rs = 1._rp/scalars(iscal)%alphas
+            if(abs(rf-rs) <= small*rf) cycle
+            do k=1,n(3)
+              do j=1,n(2)
+                do i=1,n(1)
+                  sx = .5_rp*(abs(kcr(i,j,k,1,nset))+abs(kcr(i,j,k,2,nset))) + .125_rp*( &
+                       abs(kcr(i,j,k,3,nset))+abs(kcr(i+1,j,k,3,nset))+abs(kcr(i,j-1,k,3,nset))+abs(kcr(i+1,j-1,k,3,nset)) + &
+                       abs(kcr(i,j,k,5,nset))+abs(kcr(i+1,j,k,5,nset))+abs(kcr(i,j,k-1,5,nset))+abs(kcr(i+1,j,k-1,5,nset)))
+                  sy = .5_rp*(abs(kcr(i,j,k,3,nset))+abs(kcr(i,j,k,4,nset))) + .125_rp*( &
+                       abs(kcr(i,j,k,1,nset))+abs(kcr(i-1,j,k,1,nset))+abs(kcr(i,j+1,k,1,nset))+abs(kcr(i-1,j+1,k,1,nset)) + &
+                       abs(kcr(i,j,k,6,nset))+abs(kcr(i,j+1,k,6,nset))+abs(kcr(i,j,k-1,6,nset))+abs(kcr(i,j+1,k-1,6,nset)))
+                  sz = .5_rp*(abs(kcr(i,j,k,5,nset))+abs(kcr(i,j,k,6,nset))) + .125_rp*( &
+                       abs(kcr(i,j,k,2,nset))+abs(kcr(i-1,j,k,2,nset))+abs(kcr(i,j,k+1,2,nset))+abs(kcr(i-1,j,k+1,2,nset)) + &
+                       abs(kcr(i,j,k,4,nset))+abs(kcr(i,j-1,k,4,nset))+abs(kcr(i,j,k+1,4,nset))+abs(kcr(i,j-1,k+1,4,nset)))
+                  thxs(i,j,k,nset) = (1._rp/(1._rp/(thxt(i,j,k,nset)*rf+(1._rp-thxt(i,j,k,nset))*rs) + &
+                                      cht_kcross_stab*sx) - rs)/(rf - rs)
+                  thys(i,j,k,nset) = (1._rp/(1._rp/(thyt(i,j,k,nset)*rf+(1._rp-thyt(i,j,k,nset))*rs) + &
+                                      cht_kcross_stab*sy) - rs)/(rf - rs)
+                  thzs(i,j,k,nset) = (1._rp/(1._rp/(thzt(i,j,k,nset)*rf+(1._rp-thzt(i,j,k,nset))*rs) + &
+                                      cht_kcross_stab*sz) - rs)/(rf - rs)
+                end do
+              end do
+            end do
+          end do
+        end if
+      end block
+      !$acc enter data copyin(thxt,thyt,thzt)
+      if(allocated(kcr)) then
+        !$acc enter data copyin(kcr)
+        !
+        ! largest explicit rate B of the off-diagonal term (sum of the moduli of its stencil coefficients in a
+        ! cell, 1/time); with `cht_kcross_scheme = 'explicit'` (Runge-Kutta slope) or explicit diffusion the
+        ! time step is limited to dt <= cht_kcross_cfl/B ('douglas'/'craig-sneyd' with `is_impdiff`: no
+        ! limit, but they became unstable for dt*B of about 10-25, see `param`)
+        !
+        block
+          real(rp) :: rate,capi,dzi2
+          integer :: nset,i,j,k
+          nset = 0
+          do iscal=1,nscal
+            if(.not.scalars(iscal)%is_cht) cycle
+            nset = nset+1
+            rate = 0._rp
+            do k=1,n(3)
+              dzi2 = 1._rp/(1._rp/dzci(k-1) + 1._rp/dzci(k))
+              do j=1,n(2)
+                do i=1,n(1)
+                  capi = 1._rp/(1._rp + (scalars(iscal)%cs_cf-1._rp)*(1._rp-phi_cht(i,j,k)))
+                  rate = max(rate,capi*( &
+                         dli(1)*((abs(kcr(i,j,k,1,nset))+abs(kcr(i-1,j,k,1,nset)))*dli(2) + &
+                                 (abs(kcr(i,j,k,2,nset))+abs(kcr(i-1,j,k,2,nset)))*2._rp*dzi2) + &
+                         dli(2)*((abs(kcr(i,j,k,3,nset))+abs(kcr(i,j-1,k,3,nset)))*dli(1) + &
+                                 (abs(kcr(i,j,k,4,nset))+abs(kcr(i,j-1,k,4,nset)))*2._rp*dzi2) + &
+                         dzfi(k)*((abs(kcr(i,j,k,5,nset))+abs(kcr(i,j,k-1,5,nset)))*dli(1) + &
+                                  (abs(kcr(i,j,k,6,nset))+abs(kcr(i,j,k-1,6,nset)))*dli(2))))
+                end do
+              end do
+            end do
+            call MPI_ALLREDUCE(MPI_IN_PLACE,rate,1,MPI_REAL_RP,MPI_MAX,MPI_COMM_WORLD,ierr)
+            if(myid == 0) print*, 'CHT ',trim(cht_kface),': scalar ',iscal,' largest explicit rate of the off-diagonal term: ',rate
+            if((trim(cht_kcross_scheme) == 'explicit' .or. .not.is_impdiff) .and. rate > 0._rp) &
+              dtmax_kcr = min(dtmax_kcr,cht_kcross_cfl/rate)
+          end do
+          if(dtmax_kcr < huge(1._rp)) then
+            if(dt_f > 0.) then
+              if(myid == 0 .and. dt_f > dtmax_kcr) print*, 'WARNING: CHT ',trim(cht_kface),': fixed dt_f = ',dt_f, &
+                                                           ' exceeds the limit of the off-diagonal term, ',dtmax_kcr
+            else
+              dt = min(dt,dtmax_kcr)
+              dti = 1./dt
+            end if
+            if(myid == 0) print*, 'CHT ',trim(cht_kface),': time-step limit of the off-diagonal term = ',dtmax_kcr,'dt = ',dt
+          end if
+        end block
+      end if
+    end if
     if(is_cht_any) then
-    call cht_init(n,ng,l,dzci_g,dzfi_g,thx,thy,thz,phi_cht,scalars)
+    if(allocated(thxs)) then ! `cht_kface = 'tensor_full'`, stabilized line solvers
+      !$acc enter data copyin(thxs,thys,thzs)
+      call cht_init(n,ng,l,dzci_g,dzfi_g,thx,thy,thz,phi_cht,scalars,thxs,thys,thzs)
+      !$acc exit data delete(thxs,thys,thzs)
+      deallocate(thxs,thys,thzs)
+    else if(cht_kface(1:6) == 'tensor') then
+      call cht_init(n,ng,l,dzci_g,dzfi_g,thx,thy,thz,phi_cht,scalars,thxt,thyt,thzt)
+    else
+      call cht_init(n,ng,l,dzci_g,dzfi_g,thx,thy,thz,phi_cht,scalars)
+    end if
     if(myid == 0) print*, '*** CHT geometry set up ***'
     end if
   endif
@@ -1027,11 +1205,28 @@ program cans
           !
           ! conjugate heat transfer: no wall condition at the interface (A_s/B_s and the wall value unused)
           !
+          if(s%iset == 0) then
           call rk_scal(rkcoeff(:,irk),n,dli,l,dzci,dzfi,grid_vol_ratio_f,s%alpha,dt,is_bound,u,v,w, &
                        s%is_forced,s%scalf,s%source,s%fluxo,s%dsdtrko,s%val,s%f,A_s,B_s, &
                        swz(:,iscal),scal_mean_grad(iscal),mask_s, &
                        is_cht=s%is_cht,alphas=s%alphas,cs_cf=s%cs_cf,ssource_s=s%source_s,cbcz=s%cbc(:,3), &
                        thx=thx,thy=thy,thz=thz,phi=phi_cht,qw=qw_ibm(iscal),adens=adens)
+          else if(.not.allocated(kcr)) then ! `cht_kface = 'tensor'`: the scalar's own face fractions (and line-solver set)
+          call rk_scal(rkcoeff(:,irk),n,dli,l,dzci,dzfi,grid_vol_ratio_f,s%alpha,dt,is_bound,u,v,w, &
+                       s%is_forced,s%scalf,s%source,s%fluxo,s%dsdtrko,s%val,s%f,A_s,B_s, &
+                       swz(:,iscal),scal_mean_grad(iscal),mask_s, &
+                       is_cht=s%is_cht,alphas=s%alphas,cs_cf=s%cs_cf,ssource_s=s%source_s,cbcz=s%cbc(:,3), &
+                       thx=thxt(:,:,:,s%iset),thy=thyt(:,:,:,s%iset),thz=thzt(:,:,:,s%iset),phi=phi_cht, &
+                       qw=qw_ibm(iscal),adens=adens,iset=s%iset)
+          else ! `cht_kface = 'tensor_full'`: also the off-diagonal face conductivities (explicit, see `cht_kcross_scheme`)
+          call rk_scal(rkcoeff(:,irk),n,dli,l,dzci,dzfi,grid_vol_ratio_f,s%alpha,dt,is_bound,u,v,w, &
+                       s%is_forced,s%scalf,s%source,s%fluxo,s%dsdtrko,s%val,s%f,A_s,B_s, &
+                       swz(:,iscal),scal_mean_grad(iscal),mask_s, &
+                       is_cht=s%is_cht,alphas=s%alphas,cs_cf=s%cs_cf,ssource_s=s%source_s,cbcz=s%cbc(:,3), &
+                       thx=thxt(:,:,:,s%iset),thy=thyt(:,:,:,s%iset),thz=thzt(:,:,:,s%iset),phi=phi_cht, &
+                       qw=qw_ibm(iscal),adens=adens,iset=s%iset,kcross=kcr(:,:,:,:,s%iset), &
+                       cbcs=s%cbc,nb=nb,dl=dl,dzc=dzc)
+          end if
         else
         if(is_ibm) then
           call timer_tic('ibm_calc_a_b',nvtx_color='r',nvtx_gpu_stream=-1)
@@ -1247,7 +1442,7 @@ program cans
     if(icheck > 0.and.mod(istep,max(icheck,1)) == 0) then
       if(myid == 0) print*, 'Checking stability and divergence...'
       call chkdt(n,dl,dzci,dzfi,visc,alpha_max_eff,u,v,w,dt_cfl)
-      dt = merge(dt_f,min(cfl*dt_cfl,dtmax),dt_f > 0.)
+      dt = merge(dt_f,min(cfl*dt_cfl,dtmax,dtmax_kcr),dt_f > 0.)
       if(myid == 0) print*, 'dt_cfl = ', dt_cfl, 'dt = ', dt
       if(dt_cfl < small) then
         if(myid == 0) print*, 'ERROR: time step is too small.'
@@ -1453,8 +1648,18 @@ program cans
       if(is_wall_heat) then
         do iscal=1,nscal
           s => scalars(iscal)
+          if(s%iset == 0) then
           call calc_wall_heat(iscal,nscal,n,lo,ng,is_per,dl,dzc,dzf,mask_s,thx,thy,thz,s%val, &
                               s%alpha,s%alphas,s%is_cht,swz(:,iscal))
+          else if(.not.allocated(kcr)) then
+          call calc_wall_heat(iscal,nscal,n,lo,ng,is_per,dl,dzc,dzf,mask_s, &
+                              thxt(:,:,:,s%iset),thyt(:,:,:,s%iset),thzt(:,:,:,s%iset),s%val, &
+                              s%alpha,s%alphas,s%is_cht,swz(:,iscal))
+          else ! `cht_kface = 'tensor_full'`: with the tangential part of the face flux
+          call calc_wall_heat(iscal,nscal,n,lo,ng,is_per,dl,dzc,dzf,mask_s, &
+                              thxt(:,:,:,s%iset),thyt(:,:,:,s%iset),thzt(:,:,:,s%iset),s%val, &
+                              s%alpha,s%alphas,s%is_cht,swz(:,iscal),kc=kcr(:,:,:,:,s%iset))
+          end if
         end do
         call wall_heat_out(n,lo,nscal,mask_s,frifv,frhout,qwall)
         call write_fv_rows(trim(datadir)//'FV-heat_'//trim(mpiranknum)//'_s_'//fldnum//'.out',frhout)

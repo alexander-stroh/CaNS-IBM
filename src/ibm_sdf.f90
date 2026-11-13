@@ -33,7 +33,7 @@ module mod_ibm_sdf
   private
   public sdf_read,sdf_staggered,sdf_mask,set_ibm_2nd_sdf,calc_grad_dist_sdf,set_cht_geometry_sdf
   public frac_q,sdf_stag,sdf_point,sdf_taylor,sdf_taylor_eval
-  public sdf_interface_density
+  public sdf_interface_density,set_cht_face_tensor,cht_th_tensor,cht_kdiff,set_cht_face_o2
   contains
   subroutine sdf_read(fname,ng,lo,n,zc,ps)
     !
@@ -417,6 +417,304 @@ module mod_ibm_sdf
     end do
     if(myid == 0 .and. is_2nd) print*, 'CHT geometry (level set): cells with a sub-cell volume fraction (rank 0): ', ncut
   end subroutine set_cht_geometry_sdf
+  !
+  subroutine set_cht_face_tensor(n,dl,zc,dzf,ps,ax,ay,az,wx,wy,wz,pn,fn)
+    !
+    ! geometry of the anisotropic face conductivity of the CHT scalars (`cht_kface = 'tensor'`), from the
+    ! level set at the cell centres (ps, two halo layers); for the face between cells i and i+1 (ax, wx;
+    ! y and z alike, same indexing as thx, thy, thz):
+    !   ax: fluid area fraction of the face (the face is cut with the zero level of the quadratic Taylor
+    !       expansions of the level set about the two adjacent cell centres, averaged; ns sub-lines, exact
+    !       length along each from the quadratic, see `fluid_length`; the sub-lines run along the in-plane
+    !       direction with the larger variation of the level set over the face, so that the fraction is
+    !       exact for a planar interface parallel to either in-plane direction)
+    !   wx: n_x**2, the squared x component of the interface normal (gradient of the same expansions at
+    !       the face centre)
+    ! with these, the face conductivity is the diagonal element of the effective conductivity tensor of a
+    ! locally planar interface, k = w*k_series(th) + (1-w)*k_parallel(a) (`cht_th_tensor`): series
+    ! (harmonic) across the interface, area-weighted (arithmetic) along it, both exact for a planar
+    ! interface normal or parallel to the face direction. Faces farther from the interface than half the
+    ! diagonal of the face get w = 1 (series, i.e. unchanged), a = 0 or 1
+    ! pn (optional, `cht_kface = 'tensor_full'`): products of the normal components at the faces, for the
+    ! off-diagonal elements (k_series - k_parallel)*n_d*n_e of the tensor: pn(:,:,:,1:2) = n_x*n_y, n_x*n_z
+    ! (x faces), pn(:,:,:,3:4) = n_y*n_x, n_y*n_z (y faces), pn(:,:,:,5:6) = n_z*n_x, n_z*n_y (z faces);
+    ! zero away from the interface
+    ! fn (optional, `cht_kface = 'tensor_o2'`): unit interface normal at the faces, fn(:,:,:,1:3,d) at the
+    ! faces along d (zero away from the interface); the faces are then taken up to a full cell diagonal
+    ! from the interface, to cover all faces whose flux stencil (see `scal_cht_cross`) is cut
+    !
+    implicit none
+    integer , intent(in), dimension(3) :: n
+    real(rp), intent(in), dimension(3) :: dl
+    real(rp), intent(in), dimension(0:) :: zc,dzf
+    real(rp), intent(in), dimension(-1:,-1:,-1:) :: ps
+    real(rp), intent(out), dimension(0:,0:,0:) :: ax,ay,az,wx,wy,wz
+    real(rp), intent(out), dimension(0:,0:,0:,:), optional :: pn
+    real(rp), intent(out), dimension(0:,0:,0:,:,:), optional :: fn
+    integer, parameter :: ns = 20 ! sub-lines per face
+    real(rp), allocatable, dimension(:) :: ze
+    real(rp) :: c1(10),c2(10),g(3),pf,r,o1,o2,o3,qa,qb,qc,fsum,dz
+    integer  :: i,j,k,m,nface
+    allocate(ze(-1:n(3)+2))
+    ze(0:n(3)+1) = zc(0:n(3)+1)
+    ze(-1) = 2._rp*ze(0)-ze(1)
+    ze(n(3)+2) = 2._rp*ze(n(3)+1)-ze(n(3))
+    nface = 0
+    if(present(pn)) pn(:,:,:,:) = 0._rp
+    if(present(fn)) fn(:,:,:,:,:) = 0._rp
+    do k=0,n(3)+1
+      do j=0,n(2)+1
+        do i=0,n(1)+1
+          ax(i,j,k) = merge(1._rp,0._rp,ps(i,j,k) > 0._rp); ay(i,j,k) = ax(i,j,k); az(i,j,k) = ax(i,j,k)
+          wx(i,j,k) = 1._rp; wy(i,j,k) = 1._rp; wz(i,j,k) = 1._rp
+          dz = dzf(k)
+          !
+          ! x face (i+1/2): sub-lines along z at ns positions in y (or along y at ns positions in z, if the
+          ! level set varies more along y over the face); offsets from the centres of i and i+1
+          !
+          if(i <= n(1)) then
+            pf = 0.5_rp*(ps(i,j,k)+ps(i+1,j,k)); r = 0.5_rp*sqrt(dl(2)**2+dz**2)
+            if(present(fn)) r = sqrt(dl(1)**2+dl(2)**2+dz**2)
+            if(abs(pf) < r .or. ((ps(i,j,k) > 0._rp).neqv.(ps(i+1,j,k) > 0._rp))) then
+              call sdf_taylor(ps,i,j,k,dl,ze,c1); call sdf_taylor(ps,i+1,j,k,dl,ze,c2)
+              o1 = 0.5_rp*dl(1); fsum = 0._rp
+              g = 0.5_rp*(grad_at(c1,o1,0._rp,0._rp) + grad_at(c2,-o1,0._rp,0._rp))
+              do m=1,ns
+                if(abs(g(2))*dl(2) <= abs(g(3))*dz) then
+                  o2 = ((m-0.5_rp)/ns-0.5_rp)*dl(2)
+                  ! level set along z' in [-dz/2,dz/2] at (x_f, y_j+o2): average of both expansions
+                  qa = 0.25_rp*(c1(7)+c2(7))
+                  qb = 0.5_rp*((c1(4)+c1(9)*o1+c1(10)*o2) + (c2(4)-c2(9)*o1+c2(10)*o2))
+                  qc = 0.5_rp*(sdf_taylor_eval(c1,o1,o2,0._rp) + sdf_taylor_eval(c2,-o1,o2,0._rp))
+                  fsum = fsum + fluid_length(qa,qb,qc,0.5_rp*dz)/dz
+                else
+                  o3 = ((m-0.5_rp)/ns-0.5_rp)*dz
+                  ! level set along y' in [-dy/2,dy/2] at (x_f, z_k+o3)
+                  qa = 0.25_rp*(c1(6)+c2(6))
+                  qb = 0.5_rp*((c1(3)+c1(8)*o1+c1(10)*o3) + (c2(3)-c2(8)*o1+c2(10)*o3))
+                  qc = 0.5_rp*(sdf_taylor_eval(c1,o1,0._rp,o3) + sdf_taylor_eval(c2,-o1,0._rp,o3))
+                  fsum = fsum + fluid_length(qa,qb,qc,0.5_rp*dl(2))/dl(2)
+                end if
+              end do
+              ax(i,j,k) = fsum/ns
+              if(sum(g**2) > 0._rp) wx(i,j,k) = g(1)**2/sum(g**2)
+              if(present(pn) .and. sum(g**2) > 0._rp) pn(i,j,k,1:2) = g(1)*[g(2),g(3)]/sum(g**2)
+              if(present(fn) .and. sum(g**2) > 0._rp) fn(i,j,k,:,1) = g(:)/sqrt(sum(g**2))
+              nface = nface+1
+            end if
+          end if
+          !
+          ! y face (j+1/2): sub-lines along z at ns positions in x (or along x at ns positions in z)
+          !
+          if(j <= n(2)) then
+            pf = 0.5_rp*(ps(i,j,k)+ps(i,j+1,k)); r = 0.5_rp*sqrt(dl(1)**2+dz**2)
+            if(present(fn)) r = sqrt(dl(1)**2+dl(2)**2+dz**2)
+            if(abs(pf) < r .or. ((ps(i,j,k) > 0._rp).neqv.(ps(i,j+1,k) > 0._rp))) then
+              call sdf_taylor(ps,i,j,k,dl,ze,c1); call sdf_taylor(ps,i,j+1,k,dl,ze,c2)
+              o2 = 0.5_rp*dl(2); fsum = 0._rp
+              g = 0.5_rp*(grad_at(c1,0._rp,o2,0._rp) + grad_at(c2,0._rp,-o2,0._rp))
+              do m=1,ns
+                if(abs(g(1))*dl(1) <= abs(g(3))*dz) then
+                  o1 = ((m-0.5_rp)/ns-0.5_rp)*dl(1)
+                  qa = 0.25_rp*(c1(7)+c2(7))
+                  qb = 0.5_rp*((c1(4)+c1(9)*o1+c1(10)*o2) + (c2(4)+c2(9)*o1-c2(10)*o2))
+                  qc = 0.5_rp*(sdf_taylor_eval(c1,o1,o2,0._rp) + sdf_taylor_eval(c2,o1,-o2,0._rp))
+                  fsum = fsum + fluid_length(qa,qb,qc,0.5_rp*dz)/dz
+                else
+                  o3 = ((m-0.5_rp)/ns-0.5_rp)*dz
+                  ! level set along x' in [-dx/2,dx/2] at (y_f, z_k+o3)
+                  qa = 0.25_rp*(c1(5)+c2(5))
+                  qb = 0.5_rp*((c1(2)+c1(8)*o2+c1(9)*o3) + (c2(2)-c2(8)*o2+c2(9)*o3))
+                  qc = 0.5_rp*(sdf_taylor_eval(c1,0._rp,o2,o3) + sdf_taylor_eval(c2,0._rp,-o2,o3))
+                  fsum = fsum + fluid_length(qa,qb,qc,0.5_rp*dl(1))/dl(1)
+                end if
+              end do
+              ay(i,j,k) = fsum/ns
+              if(sum(g**2) > 0._rp) wy(i,j,k) = g(2)**2/sum(g**2)
+              if(present(pn) .and. sum(g**2) > 0._rp) pn(i,j,k,3:4) = g(2)*[g(1),g(3)]/sum(g**2)
+              if(present(fn) .and. sum(g**2) > 0._rp) fn(i,j,k,:,2) = g(:)/sqrt(sum(g**2))
+              nface = nface+1
+            end if
+          end if
+          !
+          ! z face (k+1/2, at zf(k)): sub-lines along x at ns positions in y (or along y at ns positions in x)
+          !
+          if(k <= n(3)) then
+            pf = 0.5_rp*(ps(i,j,k)+ps(i,j,k+1)); r = 0.5_rp*sqrt(dl(1)**2+dl(2)**2)
+            if(present(fn)) r = sqrt(dl(1)**2+dl(2)**2+dz**2)
+            if(abs(pf) < r .or. ((ps(i,j,k) > 0._rp).neqv.(ps(i,j,k+1) > 0._rp))) then
+              call sdf_taylor(ps,i,j,k,dl,ze,c1); call sdf_taylor(ps,i,j,k+1,dl,ze,c2)
+              o1 = 0.5_rp*dzf(k); o3 = 0.5_rp*dzf(k+1) ! face offsets from the centres of k (up) and k+1 (down)
+              fsum = 0._rp
+              g = 0.5_rp*(grad_at(c1,0._rp,0._rp,o1) + grad_at(c2,0._rp,0._rp,-o3))
+              do m=1,ns
+                o2 = ((m-0.5_rp)/ns-0.5_rp)*merge(dl(2),dl(1),abs(g(2))*dl(2) <= abs(g(1))*dl(1))
+                if(abs(g(2))*dl(2) <= abs(g(1))*dl(1)) then
+                  ! level set along x' in [-dx/2,dx/2] at (y_j+o2, z_f)
+                  qa = 0.25_rp*(c1(5)+c2(5))
+                  qb = 0.5_rp*((c1(2)+c1(8)*o2+c1(9)*o1) + (c2(2)+c2(8)*o2-c2(9)*o3))
+                  qc = 0.5_rp*(sdf_taylor_eval(c1,0._rp,o2,o1) + sdf_taylor_eval(c2,0._rp,o2,-o3))
+                  fsum = fsum + fluid_length(qa,qb,qc,0.5_rp*dl(1))/dl(1)
+                else
+                  ! level set along y' in [-dy/2,dy/2] at (x_i+o2, z_f)
+                  qa = 0.25_rp*(c1(6)+c2(6))
+                  qb = 0.5_rp*((c1(3)+c1(8)*o2+c1(10)*o1) + (c2(3)+c2(8)*o2-c2(10)*o3))
+                  qc = 0.5_rp*(sdf_taylor_eval(c1,o2,0._rp,o1) + sdf_taylor_eval(c2,o2,0._rp,-o3))
+                  fsum = fsum + fluid_length(qa,qb,qc,0.5_rp*dl(2))/dl(2)
+                end if
+              end do
+              az(i,j,k) = fsum/ns
+              if(sum(g**2) > 0._rp) wz(i,j,k) = g(3)**2/sum(g**2)
+              if(present(pn) .and. sum(g**2) > 0._rp) pn(i,j,k,5:6) = g(3)*[g(1),g(2)]/sum(g**2)
+              if(present(fn) .and. sum(g**2) > 0._rp) fn(i,j,k,:,3) = g(:)/sqrt(sum(g**2))
+              nface = nface+1
+            end if
+          end if
+        end do
+      end do
+    end do
+    if(myid == 0) print*, 'CHT tensor face conductivity: faces near the interface (rank 0): ', nface
+  contains
+    pure function grad_at(c,xo,yo,zo) result(gg)
+      real(rp), intent(in) :: c(10),xo,yo,zo
+      real(rp) :: gg(3)
+      gg(1) = c(2) + c(5)*xo + c(8)*yo + c(9)*zo
+      gg(2) = c(3) + c(8)*xo + c(6)*yo + c(10)*zo
+      gg(3) = c(4) + c(9)*xo + c(10)*yo + c(7)*zo
+    end function grad_at
+  end subroutine set_cht_face_tensor
+  !
+  pure function cht_th_tensor(th,a,w,rf,rs) result(the)
+    !
+    ! equivalent segment fraction of the tensor face conductivity k = w*k_s(th) + (1-w)*k_p(a),
+    ! k_s(th) = 1/(th*rf + (1-th)*rs), k_p(a) = a/rf + (1-a)/rs (rf, rs: inverse fluid/solid
+    ! conductivity): the value with k_s(the) = k, so that all CHT kernels keep the series form;
+    ! unchanged (the = th) for w = 1 or equal conductivities
+    !
+    real(rp), intent(in) :: th,a,w,rf,rs
+    real(rp) :: the,k
+    the = th
+    if(w >= 1._rp .or. rf == rs) return
+    k = w/(th*rf + (1._rp-th)*rs) + (1._rp-w)*(a/rf + (1._rp-a)/rs)
+    the = min(1._rp,max(0._rp,(1._rp/k - rs)/(rf - rs)))
+  end function cht_th_tensor
+  !
+  subroutine set_cht_face_o2(n,dzc,is_bz,thx,thy,thz,ax,ay,az,fn,rf,rs,thxo,thyo,thzo,kc)
+    !
+    ! second-order face conductivities of a CHT scalar (`cht_kface = 'tensor_o2'`). Near the interface the
+    ! temperature is taken as piecewise linear with the jump conditions of a locally planar interface
+    ! (continuous temperature and tangential gradient, continuous normal heat flux):
+    !
+    !   T = T0 + g.(x-x0) + (r-1)*(n.g)*min(psi,0),   r = k_f/k_s,
+    !
+    ! with g the gradient on the fluid side, n the unit normal (into the fluid) and psi the signed distance.
+    ! The difference quotients of the face-flux stencil (normal: the two adjacent cells; tangential: the
+    ! four surrounding cells, as in `scal_cht_cross`) of this field are G_d = g_d + (r-1)*(n.g)*n_d*s_d,
+    ! s_d: solid fraction of the stencil segments along d (from thx, thy, thz); hence n.g = (n.G)/sigma,
+    ! sigma = 1 + (r-1)*sum_d(n_d**2*s_d), and the exact flux through, e.g., an x face of fluid area
+    ! fraction a, a*k_f*g_x + (1-a)*k_s*(g_x + (r-1)*(n.g)*n_x), becomes
+    !
+    !   F_x = K_xx*G_x + K_xy*G_y + K_xz*G_z,   K_xx = k_a + c*n_x, K_xy = c*n_y, K_xz = c*n_z,
+    !   k_a = a*k_f + (1-a)*k_s,   c = n_x*((1-a)*(k_f-k_s) - k_a*(r-1)*s_x)/sigma.
+    !
+    ! The flux is exact for a piecewise linear temperature at a planar interface of any orientation (the
+    ! series/tensor closures have an O(1) flux error there, i.e. first-order temperatures); it reduces to
+    ! the series conductivity for a grid-aligned interface and to k_f or k_s where the stencil is not cut.
+    ! Output, in the form used by the CHT kernels: the diagonal element as equivalent segment fraction
+    ! (thxo, thyo, thzo: k = 1/(th*rf + (1-th)*rs), rf, rs: inverse fluid/solid conductivity) and the
+    ! off-diagonal elements kc(:,:,:,1:6) (as `kcr` of `tensor_full`: 1,2 = K_xy, K_xz at the x faces,
+    ! 3,4 = K_yx, K_yz, 5,6 = K_zx, K_zy). Faces on the domain boundaries along z: diagonal element only (no
+    ! tangential flux through the boundary, as for `tensor_full`).
+    !
+    implicit none
+    integer , intent(in), dimension(3) :: n
+    real(rp), intent(in), dimension(0:) :: dzc
+    logical , intent(in), dimension(0:1) :: is_bz ! subdomain at the lower/upper domain boundary along z
+    real(rp), intent(in), dimension(0:,0:,0:) :: thx,thy,thz,ax,ay,az
+    real(rp), intent(in), dimension(0:,0:,0:,:,:) :: fn
+    real(rp), intent(in) :: rf,rs
+    real(rp), intent(out), dimension(0:,0:,0:) :: thxo,thyo,thzo
+    real(rp), intent(out), dimension(0:,0:,0:,:) :: kc
+    real(rp) :: s(3),ko(3),kd,w
+    integer  :: i,j,k,nface,nclip
+    thxo(:,:,:) = thx(:,:,:); thyo(:,:,:) = thy(:,:,:); thzo(:,:,:) = thz(:,:,:)
+    kc(:,:,:,:) = 0._rp
+    if(abs(rf-rs) <= 1.e-12_rp*rf) return
+    nface = 0; nclip = 0
+    do k=1,n(3)
+      w = dzc(k-1)/(dzc(k-1)+dzc(k)) ! weight of the segment k-1 -> k in k-1 -> k+1
+      do j=1,n(2)
+        do i=0,n(1) ! x faces
+          if(sum(fn(i,j,k,:,1)**2) == 0._rp) cycle
+          s(1) = 1._rp - thx(i,j,k)
+          s(2) = 1._rp - 0.25_rp*(thy(i,j-1,k)+thy(i+1,j-1,k)+thy(i,j,k)+thy(i+1,j,k))
+          s(3) = 1._rp - 0.5_rp*(w*(thz(i,j,k-1)+thz(i+1,j,k-1)) + (1._rp-w)*(thz(i,j,k)+thz(i+1,j,k)))
+          call k_o2(ax(i,j,k),s,fn(i,j,k,:,1),1,kd,ko)
+          thxo(i,j,k) = (1._rp/kd - rs)/(rf - rs)
+          kc(i,j,k,1:2) = ko(2:3)
+        end do
+      end do
+      do j=0,n(2) ! y faces
+        do i=1,n(1)
+          if(sum(fn(i,j,k,:,2)**2) == 0._rp) cycle
+          s(2) = 1._rp - thy(i,j,k)
+          s(1) = 1._rp - 0.25_rp*(thx(i-1,j,k)+thx(i-1,j+1,k)+thx(i,j,k)+thx(i,j+1,k))
+          s(3) = 1._rp - 0.5_rp*(w*(thz(i,j,k-1)+thz(i,j+1,k-1)) + (1._rp-w)*(thz(i,j,k)+thz(i,j+1,k)))
+          call k_o2(ay(i,j,k),s,fn(i,j,k,:,2),2,kd,ko)
+          thyo(i,j,k) = (1._rp/kd - rs)/(rf - rs)
+          kc(i,j,k,3:4) = ko([1,3])
+        end do
+      end do
+    end do
+    do k=0,n(3) ! z faces
+      do j=1,n(2)
+        do i=1,n(1)
+          if(sum(fn(i,j,k,:,3)**2) == 0._rp) cycle
+          s(3) = 1._rp - thz(i,j,k)
+          s(1) = 1._rp - 0.25_rp*(thx(i-1,j,k)+thx(i-1,j,k+1)+thx(i,j,k)+thx(i,j,k+1))
+          s(2) = 1._rp - 0.25_rp*(thy(i,j-1,k)+thy(i,j-1,k+1)+thy(i,j,k)+thy(i,j,k+1))
+          call k_o2(az(i,j,k),s,fn(i,j,k,:,3),3,kd,ko)
+          thzo(i,j,k) = (1._rp/kd - rs)/(rf - rs)
+          kc(i,j,k,5:6) = ko(1:2)
+          if((k == 0 .and. is_bz(0)) .or. (k == n(3) .and. is_bz(1))) kc(i,j,k,5:6) = 0._rp
+        end do
+      end do
+    end do
+    if(myid == 0) print*, 'CHT second-order face conductivity: faces with a cut stencil, with a clipped ', &
+                          'diagonal element (rank 0): ',nface,nclip
+  contains
+    subroutine k_o2(a,s,nn,id,kd,ko)
+      !
+      ! diagonal (kd) and off-diagonal (ko, entry id unused) conductivities of a face along id
+      !
+      real(rp), intent(in)  :: a,s(3),nn(3)
+      integer , intent(in)  :: id
+      real(rp), intent(out) :: kd,ko(3)
+      real(rp) :: kf,ks,r,ka,sig,c
+      kf = 1._rp/rf; ks = 1._rp/rs; r = kf/ks
+      ka = a*kf + (1._rp-a)*ks
+      sig = 1._rp + (r-1._rp)*sum(nn(:)**2*s(:))
+      c = nn(id)*((1._rp-a)*(kf-ks) - ka*(r-1._rp)*s(id))/sig
+      ko(:) = c*nn(:)
+      kd = ka + ko(id)
+      if(any(abs(ko(:)) > 1.e-12_rp*max(kf,ks))) nface = nface+1
+      !
+      ! the diagonal element stays between k_f and k_s for a consistent planar geometry; enforced
+      !
+      if(kd < min(kf,ks)*(1._rp-1.e-9_rp) .or. kd > max(kf,ks)*(1._rp+1.e-9_rp)) nclip = nclip+1
+      kd = min(max(kd,min(kf,ks)),max(kf,ks))
+    end subroutine k_o2
+  end subroutine set_cht_face_o2
+  !
+  pure function cht_kdiff(th,a,rf,rs) result(dk)
+    !
+    ! k_series(th) - k_parallel(a), the factor of n_d*n_e in the off-diagonal elements of the face
+    ! conductivity tensor (`cht_kface = 'tensor_full'`); <= 0 for a face cut in proportion
+    !
+    real(rp), intent(in) :: th,a,rf,rs
+    real(rp) :: dk
+    dk = 1._rp/(th*rf + (1._rp-th)*rs) - (a/rf + (1._rp-a)/rs)
+  end function cht_kdiff
   !
   subroutine sdf_interface_density(n,dl,zc,dzf,ps,eps,adens,area)
     !

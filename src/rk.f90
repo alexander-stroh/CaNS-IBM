@@ -17,12 +17,14 @@ module mod_rk
                        momx_d_xy,momy_d_xy,momz_d_xy, &
                        momx_d_z ,momy_d_z ,momz_d_z, &
                        mom_xyz_ad
-  use mod_param, only: is_impdiff,is_impdiff_1d,is_boussinesq_buoyancy,is_fast_mom_kernels,is_ibm,const_scal, &
+  use mod_param, only: cht_kcross_scheme,ibm_updiss_mode,is_impdiff,is_impdiff_1d,is_boussinesq_buoyancy,is_fast_mom_kernels,is_ibm,const_scal, &
                        adv_form,bulk_vel_def,is_ibm_damp,ibm_damp_eps
   use mod_ibm_damp, only: ibm_damp_mom,ibm_damp_scal
-  use mod_scal , only: scal,scal_cht,cmpt_scalflux,scalar
+  use mod_scal , only: scal,scal_cht,scal_cht_cross,cmpt_scalflux,scalar
   use mod_cht  , only: cht_solve
+  use mod_bound, only: boundp
   use mod_utils, only: bulk_mean,bulk_mean_ibm
+  use mod_updiss, only: mom_updiss,scal_updiss,scal_updiss_cht
   use mod_types
   implicit none
   public rk,rk_scal
@@ -174,6 +176,7 @@ module mod_rk
       end if
     end if
     if(is_ibm_damp) call ibm_damp_mom(n,dli(1),ibm_damp_eps,u,v,w,dudtrk,dvdtrk,dwdtrk) ! x odd-even damping near the IB
+    if(trim(ibm_updiss_mode) /= 'none') call mom_updiss(n,dli,u,v,w,dudtrk,dvdtrk,dwdtrk)
     !
 #if !defined(_LOOP_UNSWITCHING)
     !$acc parallel loop collapse(3) default(present) async(1)
@@ -450,7 +453,8 @@ module mod_rk
   !
   subroutine rk_scal(rkpar,n,dli,l,dzci,dzfi,grid_vol_ratio_f,alpha,dt,is_bound,u,v,w, &
                      is_forced,scalf,ssource,fluxo,dsdtrko,s,f,A_s,B_s,sw,sgrad,mask_s, &
-                     is_cht,alphas,cs_cf,cbcz,thx,thy,thz,phi,ssource_s,qw,adens)
+                     is_cht,alphas,cs_cf,cbcz,thx,thy,thz,phi,ssource_s,qw,adens,iset,kcross, &
+                     cbcs,nb,dl,dzc)
 #if defined(_OPENACC)
     use mod_common_cudecomp, only: dsdtrk_t => work
 #endif
@@ -504,10 +508,18 @@ module mod_rk
     real(rp) :: ssource_s_
     character(len=1), intent(in), dimension(0:1), optional :: cbcz
     real(rp), intent(in), dimension(0:,0:,0:), optional :: thx,thy,thz,phi
+    integer , intent(in), optional :: iset ! CHT line-solver set (`cht_kface = 'tensor'`; default: 0)
+    real(rp), intent(in), dimension(0:,0:,0:,:), optional :: kcross ! off-diagonal face conductivities (`cht_kface = 'tensor_full'`)
+    ! boundary data for the halos of the Craig-Sneyd correction (`kcross` with `is_impdiff`, see `rk_scal_cht`)
+    character(len=1), intent(in), dimension(0:1,3), optional :: cbcs
+    integer , intent(in), dimension(0:1,3), optional :: nb
+    real(rp), intent(in), dimension(3), optional :: dl
+    real(rp), intent(in), dimension(0:), optional :: dzc
     real(rp), intent(in), optional :: qw
     real(rp), intent(in), dimension(0:,0:,0:), optional :: adens
     logical  :: is_cht_
     real(rp) :: qw_
+    integer  :: iset_
     !
     is_cht_ = .false.
     if(present(is_cht)) is_cht_ = is_cht
@@ -557,18 +569,23 @@ module mod_rk
       !
       qw_ = 0._rp
       if(present(qw).and.present(adens)) qw_ = qw
+      iset_ = 0
+      if(present(iset)) iset_ = iset
       if(qw_ /= 0._rp) then
-        call rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas,cs_cf,ssource,ssource_s_, &
-                         is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_,adens)
+        call rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas,cs_cf,ssource,ssource_s_,sgrad, &
+                         is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_,adens,iset_,kcross, &
+                         cbcs,nb,dl,dzc,is_bound)
       else
-        call rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas,cs_cf,ssource,ssource_s_, &
-                         is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_,phi) ! adens unused
+        call rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas,cs_cf,ssource,ssource_s_,sgrad, &
+                         is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_,phi,iset_,kcross, & ! adens unused
+                         cbcs,nb,dl,dzc,is_bound)
       end if
       return
     end if
     !
     call scal(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,alpha,u,v,w,s,dsdtrk,dsdtrkd)
     if(is_ibm_damp) call ibm_damp_scal(n,dli(1),ibm_damp_eps,u,s,dsdtrk) ! x odd-even damping near the IB
+    if(trim(ibm_updiss_mode) /= 'none') call scal_updiss(n,dli,u,v,w,s,dsdtrk)
     if(.not.const_scal) then
       !
       ! advection of the imposed mean gradient, -u*sgrad: part of the explicit rhs,
@@ -673,12 +690,13 @@ module mod_rk
     end do
   end subroutine rk_scal
   !
-  subroutine rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas_in,cs_cf_in,ssource_in,ssource_s_in, &
-                         is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_in,adens)
+  subroutine rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas_in,cs_cf_in,ssource_in,ssource_s_in,sgrad_in, &
+                         is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_in,adens,iset,kcross, &
+                         cbcs,nb,dl,dzc,is_bnd)
     !
     ! Runge-Kutta substep of a scalar with conjugate heat transfer (see `rk_scal`, `scal_cht`, `mod_cht`);
-    ! all arguments are non-optional, and the scalar inputs are copied to locals, so that the
-    ! asynchronous device loops only reference plain (present) data
+    ! the scalar inputs are copied to locals, so that the asynchronous device loops only reference
+    ! plain (present) data; the optional arguments (`cht_kface = 'tensor_full'`) are only passed on
     !
     implicit none
     integer , intent(in), dimension(3) :: n
@@ -686,6 +704,7 @@ module mod_rk
     real(rp), intent(in), dimension(0:) :: dzci,dzfi
     real(rp), intent(in), dimension(:) :: grid_vol_ratio_f
     real(rp), intent(in) :: factor1,factor2,factor12,alpha,alphas_in,cs_cf_in,ssource_in,ssource_s_in
+    real(rp), intent(in) :: sgrad_in ! imposed mean streamwise gradient (used if .not.const_scal)
     logical , intent(in) :: is_forced
     real(rp), intent(in) :: scalf
     real(rp), intent(in), dimension(0:,0:,0:) :: u,v,w,thx,thy,thz,phi
@@ -695,11 +714,52 @@ module mod_rk
     real(rp), intent(out) :: f
     real(rp), intent(in) :: qw_in                             ! interfacial heat flux (0: none)
     real(rp), intent(in), dimension(0:,0:,0:) :: adens        ! interface area per unit volume (used if qw_in /= 0)
-    real(rp) :: alphas,cs_cf,ss,sss,f1,f2,f12,capi,mean,qw
+    integer , intent(in) :: iset                              ! line-solver set of `mod_cht` (0: geometric)
+    real(rp), intent(in), dimension(0:,0:,0:,:), optional :: kcross ! off-diagonal face conductivities (`cht_kface = 'tensor_full'`)
+    character(len=1), intent(in), dimension(0:1,3), optional :: cbcs ! boundary data for the halos of dT (Craig-Sneyd)
+    integer , intent(in), dimension(0:1,3), optional :: nb
+    real(rp), intent(in), dimension(3), optional :: dl
+    real(rp), intent(in), dimension(0:), optional :: dzc
+    logical , intent(in), dimension(0:1,3), optional :: is_bnd
+    real(rp), allocatable, dimension(:,:,:), save :: dth ! dT with halos (Craig-Sneyd correction)
+    real(rp), dimension(0:1,3) :: bc0
+    real(rp) :: alphas,cs_cf,ss,sss,f1,f2,f12,capi,mean,qw,sg
     integer :: i,j,k
-    alphas = alphas_in; cs_cf = cs_cf_in; ss = ssource_in; sss = ssource_s_in; qw = qw_in
+    alphas = alphas_in; cs_cf = cs_cf_in; ss = ssource_in; sss = ssource_s_in; qw = qw_in; sg = sgrad_in
     f1 = factor1; f2 = factor2; f12 = factor12
     call scal_cht(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,alpha,alphas,cs_cf,u,v,w,thx,thy,thz,phi,s,dsdtrk,dsdtrkd)
+    if(trim(ibm_updiss_mode) /= 'none') call scal_updiss_cht(n,dli,cs_cf,phi,u,v,w,s,dsdtrk) ! upwind dissipation near the interface
+    if(present(kcross)) then
+      !
+      ! off-diagonal part of the face conductivity tensor (`cht_kface = 'tensor_full'`), explicit: by
+      ! default (`cht_kcross_scheme = 'explicit'`) part of the Runge-Kutta slope, also with implicit
+      ! diffusion (time step limited by its rate, see `main`); with 'douglas'/'craig-sneyd' and implicit
+      ! diffusion it is added to the diffusion at the current level, i.e. it enters the explicit predictor
+      ! of the Douglas scheme (forward Euler per substep, see `mod_cht`), and with 'craig-sneyd' it is
+      ! corrected after the solve (below)
+      !
+      if(is_impdiff .and. trim(cht_kcross_scheme) /= 'explicit') then
+        call scal_cht_cross(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,cs_cf,phi,kcross,s,dsdtrkd)
+      else
+        call scal_cht_cross(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,cs_cf,phi,kcross,s,dsdtrk)
+      end if
+    end if
+    if(.not.const_scal) then
+      !
+      ! advection of the imposed mean gradient, -u*sgrad (as in `rk_scal`), per unit heat capacity of the
+      ! cell; it vanishes in the solid, where u = 0
+      !
+      !$acc parallel loop collapse(3) default(present) private(capi) async(1)
+      !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared) PRIVATE(capi)
+      do k=1,n(3)
+        do j=1,n(2)
+          do i=1,n(1)
+            capi = 1._rp/(1._rp + (cs_cf-1._rp)*(1._rp-phi(i,j,k)))
+            dsdtrk(i,j,k) = dsdtrk(i,j,k) - sg*.5_rp*(u(i,j,k)+u(i-1,j,k))*capi
+          end do
+        end do
+      end do
+    end if
     if(is_impdiff) then
       !
       ! delta form of Crank-Nicolson with approximate factorization in x, y and z (see `mod_cht`);
@@ -718,7 +778,7 @@ module mod_rk
           end do
         end do
       end do
-      call cht_solve(n,0.5_rp*f12,alpha,alphas,cs_cf,cbcz,dsdtrkd)
+      call cht_solve(n,0.5_rp*f12,alpha,alphas,cs_cf,cbcz,dsdtrkd,iset)
       !$acc parallel loop collapse(3) default(present) async(1)
       !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared)
       do k=1,n(3)
@@ -728,6 +788,54 @@ module mod_rk
           end do
         end do
       end do
+      if(present(kcross) .and. trim(cht_kcross_scheme) == 'craig-sneyd') then
+        !
+        ! Craig-Sneyd correction of the explicit off-diagonal term (Craig & Sneyd 1988; In 't Hout &
+        ! Welfert 2009, theta = 1/2): the predictor is updated with half the change of the
+        ! off-diagonal term over the substep, and the factorized system is solved again,
+        !
+        !   Y0~ = Y0 + f12/2*(L_c(Y3) - L_c(T)),   Y3~ = T + (1 - f12/2*L_x)^-1(1 - f12/2*L_y)^-1(1 - f12/2*L_z)^-1 (Y0~ - T),
+        !
+        ! which, the operators being linear, is the increment dT~ = dT + solve(f12/2*L_c(dT)); dT gets
+        ! homogeneous boundary conditions (the off-diagonal fluxes vanish at the boundaries along z)
+        !
+        if(.not.allocated(dth)) then
+          allocate(dth(0:n(1)+1,0:n(2)+1,0:n(3)+1))
+          !$acc enter data create(dth)
+        end if
+        !$acc parallel loop collapse(3) default(present) async(1)
+        !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared)
+        do k=1,n(3)
+          do j=1,n(2)
+            do i=1,n(1)
+              dth(i,j,k) = dsdtrkd(i,j,k)
+              dsdtrkd(i,j,k) = 0._rp
+            end do
+          end do
+        end do
+        bc0(:,:) = 0._rp
+        call boundp(cbcs,n,bc0,nb,is_bnd,dl,dzc,dth)
+        call scal_cht_cross(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,cs_cf,phi,kcross,dth,dsdtrkd)
+        !$acc parallel loop collapse(3) default(present) async(1)
+        !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared)
+        do k=1,n(3)
+          do j=1,n(2)
+            do i=1,n(1)
+              dsdtrkd(i,j,k) = 0.5_rp*f12*dsdtrkd(i,j,k)
+            end do
+          end do
+        end do
+        call cht_solve(n,0.5_rp*f12,alpha,alphas,cs_cf,cbcz,dsdtrkd,iset)
+        !$acc parallel loop collapse(3) default(present) async(1)
+        !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared)
+        do k=1,n(3)
+          do j=1,n(2)
+            do i=1,n(1)
+              s(i,j,k) = s(i,j,k) + dsdtrkd(i,j,k)
+            end do
+          end do
+        end do
+      end if
     else
       !$acc parallel loop collapse(3) default(present) private(capi) async(1)
       !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared) PRIVATE(capi)

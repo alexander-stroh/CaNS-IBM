@@ -97,6 +97,26 @@ module mod_ibm
                        real(n_wave(side,i)*x1/l(i),rp)+phase_l(side,i)))+&
                        amp_l(side,ii)*0.5_rp*(1._rp+sin(2._rp*pi*&
                        real(n_wave(side,ii)*x2/l(ii),rp)+phase_l(side,ii)))
+            case('cones')
+                !
+                ! staggered truncated cones (Theobald et al., WCCM-ECCOMAS 2020): height amp_l(side,i),
+                ! base radius 1.25*height, flank slope 55 degrees; n_wave(side,i) x n_wave(side,ii) units
+                ! of two cones each, centred at (1/4,1/4) and (3/4,3/4) of the unit
+                !
+                block
+                  real(rp) :: lu1,lu2,d1,d2,r,rb,rt
+                  lu1 = l(i )/n_wave(side,i )
+                  lu2 = l(ii)/n_wave(side,ii)
+                  d1 = x1-0.25_rp*lu1; d1 = d1-lu1*nint(d1/lu1)
+                  d2 = x2-0.25_rp*lu2; d2 = d2-lu2*nint(d2/lu2)
+                  r  = sqrt(d1**2+d2**2)
+                  d1 = x1-0.75_rp*lu1; d1 = d1-lu1*nint(d1/lu1)
+                  d2 = x2-0.75_rp*lu2; d2 = d2-lu2*nint(d2/lu2)
+                  r  = min(r,sqrt(d1**2+d2**2))
+                  rb = 1.25_rp*amp_l(side,i)
+                  rt = rb-amp_l(side,i)/tan(55._rp*pi/180._rp)
+                  height = amp_l(side,i)*min(1._rp,max(0._rp,(rb-r)/(rb-rt)))
+                end block
             case default ! 'macdonald'
                 if(side == 0)then
                     height=amp_l(side,i)*(1._rp + &
@@ -1999,7 +2019,7 @@ module mod_ibm
         !$acc update device(wf_imp)
     end subroutine calc_wall_force
     !
-    subroutine calc_wall_heat(m,nscal,n,lo,ng,is_per,dl,dzc,dzf,mask_s,thx,thy,thz,s,kf,ks,is_cht,tw)
+    subroutine calc_wall_heat(m,nscal,n,lo,ng,is_per,dl,dzc,dzf,mask_s,thx,thy,thz,s,kf,ks,is_cht,tw,kc)
         !
         ! wall heat flux of scalar m per cell (`FV-heat` output), from the diffusive fluxes of the
         ! discretisation across the centre-to-centre segments cut by the interface (fluid centre f, solid
@@ -2012,6 +2032,10 @@ module mod_ibm
         !    the solid side
         !  - no CHT: the 2nd-order IBM, a linear profile from the fluid node to the wall value T_w at the
         !    distance th*h:  q = k_f*(T_f - T_w)/(th*h),  T_i = T_w
+        !  - CHT with `cht_kface = 'tensor_full'` (kc present): the tangential part of the face flux, as in
+        !    `scal_cht_cross`, is added to q, e.g. for an x face q = q_series - sgn*(K_xy*dT/dy + K_xz*dT/dz),
+        !    sgn = +1 if the fluid centre is at the lower index (the heat leaving the fluid cell through the
+        !    face); T_i still follows from the normal (series) part
         ! the heat flow q*A_face goes to the cell that contains the interface point; accumulated in
         ! wh_q(:,:,:,3*m-2:3*m) = [heat flow, T_i*A_face, A_face]; segments from the local cells 1..n to
         ! their + neighbour (that across the domain boundary only if periodic), so that each counts once
@@ -2027,9 +2051,10 @@ module mod_ibm
         real(rp), intent(in)                      :: kf,ks
         real(rp), intent(in), dimension(0:)       :: tw ! wall value per level k
         logical , intent(in)                      :: is_cht
+        real(rp), intent(in), dimension(0:,0:,0:,:), optional :: kc ! off-diagonal face conductivities
         real(rp), parameter :: eps = 1.e-10_rp
         integer  :: ax,i,j,k,ie(3),imax(3),f(3),sc(3),o(3),mc
-        real(rp) :: th,h,af,dface,q,ti
+        real(rp) :: th,h,af,dface,q,ti,fc,dzi2,sgn
         if(.not.allocated(wh_q)) then
             allocate(wh_q(0:n(1)+1,0:n(2)+1,0:n(3)+1,3*nscal))
             wh_q(:,:,:,:) = 0._rp
@@ -2056,6 +2081,26 @@ module mod_ibm
                         if(is_cht) then
                             q  = (s(f(1),f(2),f(3))-s(sc(1),sc(2),sc(3)))/(th*h/kf + (1._rp-th)*h/ks)
                             ti = s(f(1),f(2),f(3)) - q*th*h/kf
+                            if(present(kc)) then
+                                !
+                                ! tangential flux K_de*dT/de through the face (i,j,k)+1/2 along ax (same stencil
+                                ! as `scal_cht_cross`)
+                                !
+                                dzi2 = 1._rp/(dzc(k-1) + dzc(k))
+                                select case(ax)
+                                case(1)
+                                    fc = kc(i,j,k,1)*(s(i,j+1,k)+s(i+1,j+1,k)-s(i,j-1,k)-s(i+1,j-1,k))*.25_rp/dl(2) + &
+                                         kc(i,j,k,2)*(s(i,j,k+1)+s(i+1,j,k+1)-s(i,j,k-1)-s(i+1,j,k-1))*.5_rp*dzi2
+                                case(2)
+                                    fc = kc(i,j,k,3)*(s(i+1,j,k)+s(i+1,j+1,k)-s(i-1,j,k)-s(i-1,j+1,k))*.25_rp/dl(1) + &
+                                         kc(i,j,k,4)*(s(i,j,k+1)+s(i,j+1,k+1)-s(i,j,k-1)-s(i,j+1,k-1))*.5_rp*dzi2
+                                case(3)
+                                    fc = kc(i,j,k,5)*(s(i+1,j,k)+s(i+1,j,k+1)-s(i-1,j,k)-s(i-1,j,k+1))*.25_rp/dl(1) + &
+                                         kc(i,j,k,6)*(s(i,j+1,k)+s(i,j+1,k+1)-s(i,j-1,k)-s(i,j-1,k+1))*.25_rp/dl(2)
+                                end select
+                                sgn = merge(1._rp,-1._rp,.not.mask_s(i,j,k)) ! fluid centre at the lower index
+                                q = q - sgn*fc
+                            end if
                         else
                             th = max(th,eps)
                             q  = kf*(s(f(1),f(2),f(3))-tw(sc(3)))/(th*h)

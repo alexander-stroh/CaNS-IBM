@@ -97,6 +97,24 @@ real(rp)          , protected, allocatable, dimension(:) ::  bcscal_ibm_top ! si
 logical , protected, allocatable, dimension(:) :: is_cht ! size (nscal)
 real(rp), protected, allocatable, dimension(:) :: ks_kf  ! size (nscal)
 real(rp), protected, allocatable, dimension(:) :: cs_cf  ! size (nscal)
+! face conductivity of the CHT scalars at cut faces: 'series' (harmonic along the centre-to-centre segment)
+! or 'tensor' (diagonal of the effective conductivity tensor of the local interface: series across it,
+! area-weighted along it; needs `geometry = 'sdf'`), or 'tensor_full' (the same, plus the off-diagonal
+! elements of the tensor, as an explicit term)
+character(len=16), protected :: cht_kface = 'series'
+!
+! 'tensor_full': time integration of the off-diagonal term, cht_kcross_scheme =
+!   'explicit'    (default) part of the Runge-Kutta slope, also with implicit diffusion (the diagonal stays
+!                 implicit); the time step is limited to dt <= cht_kcross_cfl/B, B the largest explicit
+!                 rate of the term (printed at start-up; not applied with a fixed `dt_f`, only checked)
+!   'douglas'     explicit in the predictor of the factorized (Douglas) implicit scheme (forward Euler per
+!                 substep), no time-step limit, but unstable for dt*B of about 10-25
+!   'craig-sneyd' 'douglas' plus the Craig-Sneyd correction (a second solve per substep); was less stable
+! cht_kcross_stab ('douglas', 'craig-sneyd'): extra face conductivity cht_kcross_stab*(bound of the
+! off-diagonal term) for the line solvers, left-hand side only (0: off; delayed, did not remove, the instability)
+character(len=16), protected :: cht_kcross_scheme = 'explicit'
+real(rp), protected :: cht_kcross_cfl = 2._rp
+real(rp), protected :: cht_kcross_stab = 0._rp
 !
 ! interfacial heat flux (CHT scalars): heat released per unit interface area at the IB surface (flux jump
 ! -k_s dT/dn|_s + qw_ibm = -k_f dT/dn|_f, n pointing into the fluid, cf. Liu & Hasegawa, Comput. Fluids 318
@@ -151,10 +169,14 @@ real(rp), protected   :: l_0(0:1,3)=0._rp
 integer, protected    :: n_wave(0:1,3)=0._rp
 real(rp), protected   :: amp_l(0:1,3)=0._rp
 real(rp), protected   :: phase_l(0:1,3)=0._rp
-character(len=16), protected :: ibm_shape = 'macdonald' ! analytic wall shape: 'macdonald' or 'sinusoid'
+character(len=16), protected :: ibm_shape = 'macdonald' ! analytic wall shape: 'macdonald', 'sinusoid' or 'cones'
 real(rp), protected   :: ibm_hch = -1._rp ! reference half height for the rough-wall grid (gtype = 5)
 character(len=16), protected :: bulk_vel_def = 'superficial' ! IBM bulk velocity: 'superficial' or 'intrinsic'
 character(len=16), protected :: ibm_proj = 'none' ! IB-aware velocity correction: 'none', 'damped' or 'masked'
+character(len=16), protected :: ibm_updiss_mode = 'none' ! upwind dissipation near the body: 'none' or 'body'
+real(rp), protected   :: ibm_updiss = 1._rp ! its coefficient c
+integer , protected   :: ibm_updiss_ncell = 2 ! layer width in fluid cells from the immersed wall ...
+integer , protected   :: ibm_updiss_ntaper = 0 ! ... and the width of its cosine taper in cells
 ! masked projection (`ibm_proj = 'masked'`, see `mod_ibm_mproj`): relative residual and maximum number of the
 ! preconditioned conjugate-gradient iterations per Runge-Kutta stage
 real(rp), protected :: mproj_tol = 1.e-3_rp
@@ -216,7 +238,7 @@ contains
                      cbcscal,bcscal, &
                      cbcscal_ibm,bcscal_ibm,bcscal_ibm_top,&
                      const_scal,scal_mean_grad,&
-                     is_cht,ks_kf,cs_cf,&
+                     is_cht,ks_kf,cs_cf,cht_kface,cht_kcross_scheme,cht_kcross_cfl,cht_kcross_stab,&
                      qw_ibm,qw_ibm_eps,&
                      ssource,ssource_s, &
                      is_sforced, &
@@ -247,6 +269,10 @@ contains
                             ibm_proj,         &
                             mproj_tol,mproj_maxit, &
                             ibm_iout_wall,    &
+                            ibm_updiss_mode,  &
+                            ibm_updiss,       &
+                            ibm_updiss_ncell, &
+                            ibm_updiss_ntaper, &
                             geometry,         &
                             sdf_file,         &
                             dump_ibm_geometry
@@ -527,6 +553,26 @@ contains
     ! checks of the CHT input (the `ibm` namelist is read after `scalar`)
     !
     if(nscal > 0) then
+      if(.not.any(trim(cht_kface) == ['series     ','tensor     ','tensor_full','tensor_o2  '])) then
+        if(myid == 0) print*, 'ERROR: reading the input file: `cht_kface` must be `series`, `tensor`, `tensor_full` ', &
+                              'or `tensor_o2`.'
+        if(myid == 0) print*, 'Aborting...'
+        call MPI_FINALIZE(ierr)
+        error stop
+      end if
+      if(.not.any(trim(cht_kcross_scheme) == ['explicit   ','douglas    ','craig-sneyd']) .or. cht_kcross_cfl <= 0._rp) then
+        if(myid == 0) print*, 'ERROR: reading the input file: `cht_kcross_scheme` must be `explicit`, `douglas` or ', &
+                              '`craig-sneyd`, and `cht_kcross_cfl > 0`.'
+        if(myid == 0) print*, 'Aborting...'
+        call MPI_FINALIZE(ierr)
+        error stop
+      end if
+      if(cht_kface(1:6) == 'tensor' .and. trim(geometry) /= 'sdf') then
+        if(myid == 0) print*, 'ERROR: reading the input file: `cht_kface = ''tensor*''` requires `geometry = ''sdf''`.'
+        if(myid == 0) print*, 'Aborting...'
+        call MPI_FINALIZE(ierr)
+        error stop
+      end if
       if(any(qw_ibm(:) /= 0._rp .and. .not.is_cht(:)).or.qw_ibm_eps <= 0._rp) then
         if(myid == 0) print*, 'ERROR: reading the input file: `qw_ibm /= 0` requires `is_cht = T`, and `qw_ibm_eps > 0`.'
         if(myid == 0) print*, 'Aborting...'

@@ -10,7 +10,7 @@ module mod_scal
   use mod_solve_helmholtz, only: rhs_bound
   implicit none
   private
-  public scal,scal_cht,scalar,cmpt_scalflux,bulk_forcing_s,initialize_scalars
+  public scal,scal_cht,scal_cht_cross,scalar,cmpt_scalflux,bulk_forcing_s,initialize_scalars
   !
   ! scalar derived type
   !
@@ -21,6 +21,7 @@ module mod_scal
     logical  :: is_cht    ! conjugate heat transfer: scalar also solved inside the IBM solid
     real(rp) :: alphas    ! solid conductivity over the fluid heat capacity (= alpha*ks_kf)
     real(rp) :: cs_cf     ! solid-to-fluid volumetric heat capacity ratio
+    integer  :: iset = 0  ! CHT face-fraction set (0: geometric thx/thy/thz; > 0: `cht_kface = 'tensor'`)
     real(rp) :: alpha_max ! largest effective diffusivity (conductivity over heat capacity)
     character(len=100) :: ini
     character(len=1), dimension(0:1,3) :: cbc
@@ -405,6 +406,55 @@ module mod_scal
       end do
     end do
   end subroutine scal_cht
+  !
+  subroutine scal_cht_cross(nx,ny,nz,dxi,dyi,dzci,dzfi,cs_cf,phi,kc,s,dsdt)
+    !
+    ! off-diagonal part of the face conductivity tensor of a CHT scalar (`cht_kface = 'tensor_full'`),
+    ! added explicitly to dsdt: with the effective tensor of a locally planar interface,
+    ! K = k_p*I + (k_s-k_p)*n*n^T (k_s: series, k_p: parallel (area-weighted) conductivity, n: normal),
+    ! the diagonal element is in the face fractions of the implicit/explicit diffusion, and the flux
+    ! through, e.g., an x face gets the tangential part
+    !
+    !   F_x = K_xy*dT/dy + K_xz*dT/dz,   K_xy = (k_s-k_p)*n_x*n_y = kc(:,:,:,1), K_xz = kc(:,:,:,2),
+    !
+    ! with the tangential derivatives at the face centre from the four surrounding cell centres
+    ! (y faces: kc(:,:,:,3:4) for dT/dx, dT/dz; z faces: kc(:,:,:,5:6) for dT/dx, dT/dy); the term is
+    ! conservative, (div F)/C, and nonzero only near the interface (kc = 0 elsewhere and at the
+    ! domain boundaries along z); `s` needs valid halos (corners included)
+    !
+    implicit none
+    integer , intent(in) :: nx,ny,nz
+    real(rp), intent(in) :: dxi,dyi,cs_cf
+    real(rp), intent(in), dimension(0:) :: dzci,dzfi
+    real(rp), intent(in), dimension(0:,0:,0:) :: phi,s
+    real(rp), intent(in), dimension(0:,0:,0:,:) :: kc
+    real(rp), intent(inout), dimension(:,:,:) :: dsdt
+    integer :: i,j,k
+    real(rp) :: fxp,fxm,fyp,fym,fzp,fzm,dzi2,capi
+    !$acc parallel loop collapse(3) default(present) private(fxp,fxm,fyp,fym,fzp,fzm,dzi2,capi) async(1)
+    !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared) PRIVATE(fxp,fxm,fyp,fym,fzp,fzm,dzi2,capi)
+    do k=1,nz
+      do j=1,ny
+        do i=1,nx
+          dzi2 = 1._rp/(1._rp/dzci(k-1) + 1._rp/dzci(k)) ! 1/(z(k+1)-z(k-1))
+          fxp = kc(i  ,j,k,1)*(s(i  ,j+1,k)+s(i+1,j+1,k)-s(i  ,j-1,k)-s(i+1,j-1,k))*.25_rp*dyi + &
+                kc(i  ,j,k,2)*(s(i  ,j,k+1)+s(i+1,j,k+1)-s(i  ,j,k-1)-s(i+1,j,k-1))*.5_rp*dzi2
+          fxm = kc(i-1,j,k,1)*(s(i-1,j+1,k)+s(i  ,j+1,k)-s(i-1,j-1,k)-s(i  ,j-1,k))*.25_rp*dyi + &
+                kc(i-1,j,k,2)*(s(i-1,j,k+1)+s(i  ,j,k+1)-s(i-1,j,k-1)-s(i  ,j,k-1))*.5_rp*dzi2
+          fyp = kc(i,j  ,k,3)*(s(i+1,j  ,k)+s(i+1,j+1,k)-s(i-1,j  ,k)-s(i-1,j+1,k))*.25_rp*dxi + &
+                kc(i,j  ,k,4)*(s(i,j  ,k+1)+s(i,j+1,k+1)-s(i,j  ,k-1)-s(i,j+1,k-1))*.5_rp*dzi2
+          fym = kc(i,j-1,k,3)*(s(i+1,j-1,k)+s(i+1,j  ,k)-s(i-1,j-1,k)-s(i-1,j  ,k))*.25_rp*dxi + &
+                kc(i,j-1,k,4)*(s(i,j-1,k+1)+s(i,j  ,k+1)-s(i,j-1,k-1)-s(i,j  ,k-1))*.5_rp*dzi2
+          fzp = kc(i,j,k  ,5)*(s(i+1,j,k  )+s(i+1,j,k+1)-s(i-1,j,k  )-s(i-1,j,k+1))*.25_rp*dxi + &
+                kc(i,j,k  ,6)*(s(i,j+1,k  )+s(i,j+1,k+1)-s(i,j-1,k  )-s(i,j-1,k+1))*.25_rp*dyi
+          fzm = kc(i,j,k-1,5)*(s(i+1,j,k-1)+s(i+1,j,k  )-s(i-1,j,k-1)-s(i-1,j,k  ))*.25_rp*dxi + &
+                kc(i,j,k-1,6)*(s(i,j+1,k-1)+s(i,j+1,k  )-s(i,j-1,k-1)-s(i,j-1,k  ))*.25_rp*dyi
+          capi = 1._rp/(1._rp + (cs_cf-1._rp)*(1._rp-phi(i,j,k)))
+          dsdt(i,j,k) = dsdt(i,j,k) + ((fxp-fxm)*dxi + (fyp-fym)*dyi + (fzp-fzm)*dzfi(k))*capi
+        end do
+      end do
+    end do
+  end subroutine scal_cht_cross
   !
   subroutine initialize_scalars(scalars,nscal,n,n_z)
     use mod_param, only: alphai,iniscal,cbcscal,bcscal,ssource,ssource_s,is_sforced,scalf, &

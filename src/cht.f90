@@ -61,7 +61,10 @@ module mod_cht
   ! face fractions along the line direction and fluid volume fractions in the x-, y- and z-aligned
   ! pencils (memory layout of the respective transposes)
   !
-  real(rp), allocatable, dimension(:,:,:) :: thx_x,thy_y,thz_z,phi_x,phi_y,phi_z
+  ! (face fractions: one set per CHT scalar with `cht_kface = 'tensor'`, otherwise one set; 4th index)
+  real(rp), allocatable, dimension(:,:,:,:) :: thx_x,thy_y,thz_z
+  real(rp), allocatable, dimension(:,:,:) :: phi_x,phi_y,phi_z
+  integer :: ipset = 1                                   ! face-fraction set of the current scatter/solve
   real(rp), allocatable, dimension(:,:,:) :: cwork,uwork ! work arrays of the line solvers
   real(rp), allocatable, dimension(:,:,:) :: pwork       ! permuted x/y pencil of the GPU line solves
   real(rp), allocatable, dimension(:) :: dzci_c,dzfi_c   ! global grid spacings along z
@@ -70,7 +73,7 @@ module mod_cht
   integer :: iy_axis                                     ! axis along y in the y-pencil array (1 on GPUs, 2 on CPUs)
   real(rp) :: dxi2,dyi2
   contains
-  subroutine cht_init(n,ng,l,dzci_g,dzfi_g,thx,thy,thz,phi,scalars)
+  subroutine cht_init(n,ng,l,dzci_g,dzfi_g,thx,thy,thz,phi,scalars,thxt,thyt,thzt)
     use mod_scal, only: scalar
     implicit none
     integer , intent(in), dimension(3) :: n,ng
@@ -78,7 +81,8 @@ module mod_cht
     real(rp), intent(in), dimension(0:) :: dzci_g,dzfi_g
     real(rp), intent(in), dimension(0:,0:,0:) :: thx,thy,thz,phi
     type(scalar), intent(in), dimension(:) :: scalars
-    integer :: is,nmax
+    real(rp), intent(in), dimension(0:,0:,0:,:), optional :: thxt,thyt,thzt ! per-scalar sets (`cht_kface = 'tensor'`)
+    integer :: is,nmax,nps,ip
     !
     if(.not.any(scalars(:)%is_cht)) return
     do is=1,size(scalars)
@@ -105,21 +109,34 @@ module mod_cht
     iy_axis = 1 ! axis-contiguous layout of the y pencil: (y,z,x)
 #endif
     nmax = maxval([product(nx_p),product(ny_p),product(nz_p)])
+    nps = 1
+    if(present(thxt)) nps = size(thxt,4)
 #if !defined(_OPENACC)
-    allocate(thx_x(nx_p(1),nx_p(2),nx_p(3)),phi_x(nx_p(1),nx_p(2),nx_p(3)), &
-             thy_y(ny_p(1),ny_p(2),ny_p(3)),phi_y(ny_p(1),ny_p(2),ny_p(3)))
+    allocate(thx_x(nx_p(1),nx_p(2),nx_p(3),nps),phi_x(nx_p(1),nx_p(2),nx_p(3)), &
+             thy_y(ny_p(1),ny_p(2),ny_p(3),nps),phi_y(ny_p(1),ny_p(2),ny_p(3)))
     allocate(pwork(1,1,1))
 #else
-    allocate(thx_x(nx_p(2),nx_p(1),nx_p(3)),phi_x(nx_p(2),nx_p(1),nx_p(3)), & ! permuted layouts
-             thy_y(ny_p(2),ny_p(1),ny_p(3)),phi_y(ny_p(2),ny_p(1),ny_p(3)))
+    allocate(thx_x(nx_p(2),nx_p(1),nx_p(3),nps),phi_x(nx_p(2),nx_p(1),nx_p(3)), & ! permuted layouts
+             thy_y(ny_p(2),ny_p(1),ny_p(3),nps),phi_y(ny_p(2),ny_p(1),ny_p(3)))
     allocate(pwork(nmax,1,1))
 #endif
-    allocate(thz_z(nz_p(1),nz_p(2),nz_p(3)),phi_z(nz_p(1),nz_p(2),nz_p(3)))
+    allocate(thz_z(nz_p(1),nz_p(2),nz_p(3),nps),phi_z(nz_p(1),nz_p(2),nz_p(3)))
     allocate(cwork(nmax,1,1),uwork(nmax,1,1))
     !$acc enter data create(thx_x,thy_y,thz_z,phi_x,phi_y,phi_z,cwork,uwork,pwork)
-    call scatter(n,thx,'thx')
-    call scatter(n,thy,'thy')
-    call scatter(n,thz,'thz')
+    if(present(thxt)) then
+      do ip=1,nps
+        ipset = ip
+        call scatter(n,thxt(:,:,:,ip),'thx')
+        call scatter(n,thyt(:,:,:,ip),'thy')
+        call scatter(n,thzt(:,:,:,ip),'thz')
+      end do
+    else
+      ipset = 1
+      call scatter(n,thx,'thx')
+      call scatter(n,thy,'thy')
+      call scatter(n,thz,'thz')
+    end if
+    ipset = 1
     call scatter(n,phi,'phi')
   end subroutine cht_init
   !
@@ -148,7 +165,7 @@ module mod_cht
     !$acc exit data delete(p)
   end subroutine scatter
   !
-  subroutine cht_solve(n,f,alphaf,alphas,cs_cf,cbcz,p)
+  subroutine cht_solve(n,f,alphaf,alphas,cs_cf,cbcz,p,iset)
     !
     ! solves (1 - f*L_x)(1 - f*L_y)(1 - f*L_z) dT = p for one CHT scalar; p holds the right-hand
     ! side on input and dT on output; dT satisfies homogeneous boundary conditions along z
@@ -158,6 +175,9 @@ module mod_cht
     real(rp), intent(in) :: f,alphaf,alphas,cs_cf
     character(len=1), intent(in), dimension(0:1) :: cbcz
     real(rp), intent(inout), dimension(:,:,:) :: p
+    integer , intent(in), optional :: iset ! face-fraction set (`cht_kface = 'tensor'`: the scalar's; else 0)
+    ipset = 1
+    if(present(iset)) ipset = max(iset,1)
     call transposes(n,p,'solve',f,alphaf,alphas,cs_cf,cbcz(0) == 'D',cbcz(1) == 'D')
   end subroutine cht_solve
   !
@@ -271,23 +291,23 @@ module mod_cht
       case('thx')
         if(dir == 'x') then
 #if !defined(_OPENACC)
-          thx_x(:,:,:) = q(:,:,:)
+          thx_x(:,:,:,ipset) = q(:,:,:)
 #else
-          call swap12(nx_p(1),nx_p(2),nx_p(3),q,thx_x)
+          call swap12(nx_p(1),nx_p(2),nx_p(3),q,thx_x(:,:,:,ipset))
 #endif
         end if
       case('thy')
         if(dir == 'y') then
 #if !defined(_OPENACC)
-          thy_y(:,:,:) = q(:,:,:)
+          thy_y(:,:,:,ipset) = q(:,:,:)
 #else
-          call swap12(ny_p(1),ny_p(2),ny_p(3),q,thy_y)
+          call swap12(ny_p(1),ny_p(2),ny_p(3),q,thy_y(:,:,:,ipset))
 #endif
         end if
       case('thz')
         if(dir == 'z') then
           !$acc kernels default(present) async(1)
-          thz_z(:,:,:) = q(:,:,:)
+          thz_z(:,:,:,ipset) = q(:,:,:)
           !$acc end kernels
         end if
       case('phi')
@@ -313,22 +333,22 @@ module mod_cht
         select case(dir)
         case('x')
 #if !defined(_OPENACC)
-          call solve_periodic_axis1(nx_p(1),nx_p(2),nx_p(3),ngl(1),f*dxi2,alphaf,alphas,cs_cf,thx_x,phi_x,cwork,uwork,q)
+          call solve_periodic_axis1(nx_p(1),nx_p(2),nx_p(3),ngl(1),f*dxi2,alphaf,alphas,cs_cf,thx_x(:,:,:,ipset),phi_x,cwork,uwork,q)
 #else
-          call solve_swapped(nx_p,ngl(1),f*dxi2,alphaf,alphas,cs_cf,thx_x,phi_x,q)
+          call solve_swapped(nx_p,ngl(1),f*dxi2,alphaf,alphas,cs_cf,thx_x(:,:,:,ipset),phi_x,q)
 #endif
         case('y')
 #if !defined(_OPENACC)
           if(iy_axis == 1) then
-            call solve_periodic_axis1(ny_p(1),ny_p(2),ny_p(3),ngl(2),f*dyi2,alphaf,alphas,cs_cf,thy_y,phi_y,cwork,uwork,q)
+            call solve_periodic_axis1(ny_p(1),ny_p(2),ny_p(3),ngl(2),f*dyi2,alphaf,alphas,cs_cf,thy_y(:,:,:,ipset),phi_y,cwork,uwork,q)
           else
-            call solve_periodic_axis2(ny_p(1),ny_p(2),ny_p(3),ngl(2),f*dyi2,alphaf,alphas,cs_cf,thy_y,phi_y,cwork,uwork,q)
+            call solve_periodic_axis2(ny_p(1),ny_p(2),ny_p(3),ngl(2),f*dyi2,alphaf,alphas,cs_cf,thy_y(:,:,:,ipset),phi_y,cwork,uwork,q)
           end if
 #else
-          call solve_swapped(ny_p,ngl(2),f*dyi2,alphaf,alphas,cs_cf,thy_y,phi_y,q)
+          call solve_swapped(ny_p,ngl(2),f*dyi2,alphaf,alphas,cs_cf,thy_y(:,:,:,ipset),phi_y,q)
 #endif
         case('z')
-          call solve_z(nz_p(1),nz_p(2),nz_p(3),f,alphaf,alphas,cs_cf,is_d0,is_d1,dzci_c,dzfi_c,thz_z,phi_z,cwork,q)
+          call solve_z(nz_p(1),nz_p(2),nz_p(3),f,alphaf,alphas,cs_cf,is_d0,is_d1,dzci_c,dzfi_c,thz_z(:,:,:,ipset),phi_z,cwork,q)
         end select
       end select
     end subroutine visit
