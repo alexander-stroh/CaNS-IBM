@@ -10,7 +10,7 @@ module mod_scal
   use mod_solve_helmholtz, only: rhs_bound
   implicit none
   private
-  public scal,scal_cht,scal_cht_cross,scalar,cmpt_scalflux,bulk_forcing_s,initialize_scalars
+  public scal,scal_cht,scal_cht_diff,scal_cht_cross,scalar,cmpt_scalflux,bulk_forcing_s,initialize_scalars
   !
   ! scalar derived type
   !
@@ -406,6 +406,53 @@ module mod_scal
       end do
     end do
   end subroutine scal_cht
+  !
+  subroutine scal_cht_diff(nx,ny,nz,dxi,dyi,dzci,dzfi,alphaf,alphas,cs_cf,thx,thy,thz,phi,s,dsdtd)
+    !
+    ! diffusion of a scalar with conjugate heat transfer only (the `dsdtd` of `scal_cht` with `is_impdiff`),
+    ! for the re-evaluations between the sub-iterations of `cht_kcross_scheme = 'subcycle'` (see `rk_scal_cht`)
+    !
+    implicit none
+    integer , intent(in) :: nx,ny,nz
+    real(rp), intent(in) :: dxi,dyi,alphaf,alphas,cs_cf
+    real(rp), intent(in), dimension(0:) :: dzci,dzfi
+    real(rp), dimension(0:,0:,0:), intent(in) :: s,thx,thy,thz,phi
+    real(rp), dimension(:,:,:), intent(out) :: dsdtd
+    integer :: i,j,k
+    real(rp) :: dsdxp,dsdxm,dsdyp,dsdym,dsdzp,dsdzm
+    real(rp) :: kxp,kxm,kyp,kym,kzp,kzm
+    real(rp) :: capi,diff_xy,diff_z,rf,rs
+    !
+    rf = 1./alphaf
+    rs = 1./alphas
+    !$acc parallel loop collapse(3) default(present) &
+    !$acc private(dsdxp,dsdxm,dsdyp,dsdym,dsdzp,dsdzm,kxp,kxm,kyp,kym,kzp,kzm,capi,diff_xy,diff_z) async(1)
+    !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared) &
+    !$OMP PRIVATE(dsdxp,dsdxm,dsdyp,dsdym,dsdzp,dsdzm,kxp,kxm,kyp,kym,kzp,kzm,capi,diff_xy,diff_z)
+    do k=1,nz
+      do j=1,ny
+        do i=1,nx
+          dsdxp = (s(i+1,j,k)-s(i  ,j,k))*dxi
+          dsdxm = (s(i  ,j,k)-s(i-1,j,k))*dxi
+          dsdyp = (s(i,j+1,k)-s(i,j  ,k))*dyi
+          dsdym = (s(i,j  ,k)-s(i,j-1,k))*dyi
+          dsdzp = (s(i,j,k+1)-s(i,j,k  ))*dzci(k  )
+          dsdzm = (s(i,j,k  )-s(i,j,k-1))*dzci(k-1)
+          kxp = 1./(thx(i  ,j,k)*rf + (1.-thx(i  ,j,k))*rs)
+          kxm = 1./(thx(i-1,j,k)*rf + (1.-thx(i-1,j,k))*rs)
+          kyp = 1./(thy(i,j  ,k)*rf + (1.-thy(i,j  ,k))*rs)
+          kym = 1./(thy(i,j-1,k)*rf + (1.-thy(i,j-1,k))*rs)
+          kzp = 1./(thz(i,j,k  )*rf + (1.-thz(i,j,k  ))*rs)
+          kzm = 1./(thz(i,j,k-1)*rf + (1.-thz(i,j,k-1))*rs)
+          capi = 1./(1. + (cs_cf-1.)*(1.-phi(i,j,k)))
+          diff_xy = ( (kxp*dsdxp-kxm*dsdxm)*dxi + &
+                      (kyp*dsdyp-kym*dsdym)*dyi )*capi
+          diff_z  = (kzp*dsdzp-kzm*dsdzm)*dzfi(k)*capi
+          dsdtd(i,j,k) = diff_xy + diff_z
+        end do
+      end do
+    end do
+  end subroutine scal_cht_diff
   !
   subroutine scal_cht_cross(nx,ny,nz,dxi,dyi,dzci,dzfi,cs_cf,phi,kc,s,dsdt)
     !

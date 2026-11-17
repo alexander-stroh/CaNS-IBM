@@ -17,10 +17,10 @@ module mod_rk
                        momx_d_xy,momy_d_xy,momz_d_xy, &
                        momx_d_z ,momy_d_z ,momz_d_z, &
                        mom_xyz_ad
-  use mod_param, only: cht_kcross_scheme,ibm_updiss_mode,is_impdiff,is_impdiff_1d,is_boussinesq_buoyancy,is_fast_mom_kernels,is_ibm,const_scal, &
+  use mod_param, only: cht_kcross_scheme,cht_kcross_cfl,ibm_updiss_mode,is_impdiff,is_impdiff_1d,is_boussinesq_buoyancy,is_fast_mom_kernels,is_ibm,const_scal, &
                        adv_form,bulk_vel_def,is_ibm_damp,ibm_damp_eps
   use mod_ibm_damp, only: ibm_damp_mom,ibm_damp_scal
-  use mod_scal , only: scal,scal_cht,scal_cht_cross,cmpt_scalflux,scalar
+  use mod_scal , only: scal,scal_cht,scal_cht_diff,scal_cht_cross,cmpt_scalflux,scalar
   use mod_cht  , only: cht_solve
   use mod_bound, only: boundp
   use mod_utils, only: bulk_mean,bulk_mean_ibm
@@ -454,7 +454,7 @@ module mod_rk
   subroutine rk_scal(rkpar,n,dli,l,dzci,dzfi,grid_vol_ratio_f,alpha,dt,is_bound,u,v,w, &
                      is_forced,scalf,ssource,fluxo,dsdtrko,s,f,A_s,B_s,sw,sgrad,mask_s, &
                      is_cht,alphas,cs_cf,cbcz,thx,thy,thz,phi,ssource_s,qw,adens,iset,kcross, &
-                     cbcs,nb,dl,dzc)
+                     cbcs,nb,dl,dzc,bcs,kcrate)
 #if defined(_OPENACC)
     use mod_common_cudecomp, only: dsdtrk_t => work
 #endif
@@ -515,6 +515,8 @@ module mod_rk
     integer , intent(in), dimension(0:1,3), optional :: nb
     real(rp), intent(in), dimension(3), optional :: dl
     real(rp), intent(in), dimension(0:), optional :: dzc
+    real(rp), intent(in), dimension(0:1,3), optional :: bcs ! boundary values (`cht_kcross_scheme = 'subcycle'`)
+    real(rp), intent(in), optional :: kcrate                ! largest explicit rate of the off-diagonal term
     real(rp), intent(in), optional :: qw
     real(rp), intent(in), dimension(0:,0:,0:), optional :: adens
     logical  :: is_cht_
@@ -574,11 +576,11 @@ module mod_rk
       if(qw_ /= 0._rp) then
         call rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas,cs_cf,ssource,ssource_s_,sgrad, &
                          is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_,adens,iset_,kcross, &
-                         cbcs,nb,dl,dzc,is_bound)
+                         cbcs,nb,dl,dzc,is_bound,bcs,kcrate)
       else
         call rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas,cs_cf,ssource,ssource_s_,sgrad, &
                          is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_,phi,iset_,kcross, & ! adens unused
-                         cbcs,nb,dl,dzc,is_bound)
+                         cbcs,nb,dl,dzc,is_bound,bcs,kcrate)
       end if
       return
     end if
@@ -692,7 +694,7 @@ module mod_rk
   !
   subroutine rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas_in,cs_cf_in,ssource_in,ssource_s_in,sgrad_in, &
                          is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_in,adens,iset,kcross, &
-                         cbcs,nb,dl,dzc,is_bnd)
+                         cbcs,nb,dl,dzc,is_bnd,bcs,kcrate)
     !
     ! Runge-Kutta substep of a scalar with conjugate heat transfer (see `rk_scal`, `scal_cht`, `mod_cht`);
     ! the scalar inputs are copied to locals, so that the asynchronous device loops only reference
@@ -721,7 +723,12 @@ module mod_rk
     real(rp), intent(in), dimension(3), optional :: dl
     real(rp), intent(in), dimension(0:), optional :: dzc
     logical , intent(in), dimension(0:1,3), optional :: is_bnd
+    real(rp), intent(in), dimension(0:1,3), optional :: bcs ! boundary values (halos between the sub-iterations)
+    real(rp), intent(in), optional :: kcrate                ! largest explicit rate of the off-diagonal term
     real(rp), allocatable, dimension(:,:,:), save :: dth ! dT with halos (Craig-Sneyd correction)
+    real(rp), allocatable, dimension(:,:,:), save :: asub ! explicit part of a sub-iteration ('subcycle')
+    integer :: nsub,isub
+    real(rp) :: fsub
     real(rp), dimension(0:1,3) :: bc0
     real(rp) :: alphas,cs_cf,ss,sss,f1,f2,f12,capi,mean,qw,sg
     integer :: i,j,k
@@ -760,7 +767,65 @@ module mod_rk
         end do
       end do
     end if
-    if(is_impdiff) then
+    !
+    ! `cht_kcross_scheme = 'subcycle'`: number of sub-iterations of the diffusion in this substep, so that the
+    ! forward-Euler step of the off-diagonal term stays below cht_kcross_cfl/B
+    !
+    nsub = 1
+    if(is_impdiff .and. present(kcross) .and. present(kcrate) .and. trim(cht_kcross_scheme) == 'subcycle') &
+      nsub = max(1,ceiling(f12*kcrate/cht_kcross_cfl - 1.e-9_rp))
+    if(is_impdiff .and. nsub > 1) then
+      !
+      ! the substep, T' = T + f1*N + f2*N_old + f12*(q/C + L T) (N: explicit slope, L = L_d + L_c: diagonal
+      ! and off-diagonal diffusion), is integrated in nsub sub-iterations of length f12/nsub: each gets
+      ! 1/nsub of the explicit part (asub), the factorized Crank-Nicolson step of L_d and a forward-Euler step
+      ! of L_c at its own current level; nsub = 1 is the 'douglas' form below; dsdtrk (the work buffer of the
+      ! line solvers on GPUs) is not used after asub is formed
+      !
+      if(.not.allocated(asub)) then
+        allocate(asub(n(1),n(2),n(3)))
+        !$acc enter data create(asub)
+      end if
+      fsub = f12/nsub
+      !$acc parallel loop collapse(3) default(present) private(capi) async(1)
+      !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared) PRIVATE(capi)
+      do k=1,n(3)
+        do j=1,n(2)
+          do i=1,n(1)
+            capi = 1._rp/(1._rp + (cs_cf-1._rp)*(1._rp-phi(i,j,k)))
+            asub(i,j,k) = (f1*dsdtrk(i,j,k) + f2*dsdtrko(i,j,k))/nsub + &
+                          fsub*(ss*phi(i,j,k) + sss*(1._rp-phi(i,j,k)) + qw*adens(i,j,k))*capi
+            dsdtrko(i,j,k) = dsdtrk(i,j,k)
+          end do
+        end do
+      end do
+      do isub=1,nsub
+        !$acc parallel loop collapse(3) default(present) async(1)
+        !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared)
+        do k=1,n(3)
+          do j=1,n(2)
+            do i=1,n(1)
+              dsdtrkd(i,j,k) = asub(i,j,k) + fsub*dsdtrkd(i,j,k)
+            end do
+          end do
+        end do
+        call cht_solve(n,0.5_rp*fsub,alpha,alphas,cs_cf,cbcz,dsdtrkd,iset)
+        !$acc parallel loop collapse(3) default(present) async(1)
+        !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared)
+        do k=1,n(3)
+          do j=1,n(2)
+            do i=1,n(1)
+              s(i,j,k) = s(i,j,k) + dsdtrkd(i,j,k)
+            end do
+          end do
+        end do
+        if(isub < nsub) then
+          call boundp(cbcs,n,bcs,nb,is_bnd,dl,dzc,s)
+          call scal_cht_diff(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,alpha,alphas,cs_cf,thx,thy,thz,phi,s,dsdtrkd)
+          call scal_cht_cross(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,cs_cf,phi,kcross,s,dsdtrkd)
+        end if
+      end do
+    else if(is_impdiff) then
       !
       ! delta form of Crank-Nicolson with approximate factorization in x, y and z (see `mod_cht`);
       ! dsdtrkd holds the full diffusion at the current level on input, and dT after `cht_solve`;

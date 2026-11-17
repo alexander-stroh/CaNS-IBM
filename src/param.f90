@@ -110,6 +110,10 @@ character(len=16), protected :: cht_kface = 'series'
 !   'douglas'     explicit in the predictor of the factorized (Douglas) implicit scheme (forward Euler per
 !                 substep), no time-step limit, but unstable for dt*B of about 10-25
 !   'craig-sneyd' 'douglas' plus the Craig-Sneyd correction (a second solve per substep); was less stable
+!   'subcycle'    as 'douglas', but each Runge-Kutta substep of a scalar is split into m sub-iterations of the
+!                 diffusion (factorized implicit diagonal, forward-Euler off-diagonal term; the advective slope
+!                 is spread evenly over them), m = ceiling(dt_rk*B/cht_kcross_cfl) per scalar and substep, B its
+!                 largest explicit rate: no time-step limit, one more set of line solves per extra sub-iteration
 ! cht_kcross_stab ('douglas', 'craig-sneyd'): extra face conductivity cht_kcross_stab*(bound of the
 ! off-diagonal term) for the line solvers, left-hand side only (0: off; delayed, did not remove, the instability)
 character(len=16), protected :: cht_kcross_scheme = 'explicit'
@@ -560,9 +564,10 @@ contains
         call MPI_FINALIZE(ierr)
         error stop
       end if
-      if(.not.any(trim(cht_kcross_scheme) == ['explicit   ','douglas    ','craig-sneyd']) .or. cht_kcross_cfl <= 0._rp) then
-        if(myid == 0) print*, 'ERROR: reading the input file: `cht_kcross_scheme` must be `explicit`, `douglas` or ', &
-                              '`craig-sneyd`, and `cht_kcross_cfl > 0`.'
+      if(.not.any(trim(cht_kcross_scheme) == ['explicit   ','douglas    ','craig-sneyd','subcycle   ']) &
+          .or. cht_kcross_cfl <= 0._rp) then
+        if(myid == 0) print*, 'ERROR: reading the input file: `cht_kcross_scheme` must be `explicit`, `douglas`, ', &
+                              '`craig-sneyd` or `subcycle`, and `cht_kcross_cfl > 0`.'
         if(myid == 0) print*, 'Aborting...'
         call MPI_FINALIZE(ierr)
         error stop

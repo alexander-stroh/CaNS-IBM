@@ -255,6 +255,7 @@ program cans
   ! `cht_kface = 'tensor_full'`: off-diagonal face conductivities (k_series-k_parallel)*n_d*n_e, one set per CHT scalar
   ! (`'tensor_o2'`: those of the second-order closure, see `set_cht_face_o2`)
   real(rp), allocatable, dimension(:,:,:,:,:) :: kcr
+  real(rp), allocatable, dimension(:) :: kcr_rate ! largest explicit rate of the off-diagonal term per CHT scalar set
   ! `cht_kface = 'tensor_full'` with implicit diffusion: stabilized face fractions of the line solvers (set-up only)
   real(rp), allocatable, dimension(:,:,:,:) :: thxs,thys,thzs
   logical  :: is_cht_any
@@ -947,6 +948,7 @@ program cans
         block
           real(rp) :: rate,capi,dzi2
           integer :: nset,i,j,k
+          allocate(kcr_rate(count(scalars(:)%is_cht)))
           nset = 0
           do iscal=1,nscal
             if(.not.scalars(iscal)%is_cht) cycle
@@ -969,6 +971,7 @@ program cans
             end do
             call MPI_ALLREDUCE(MPI_IN_PLACE,rate,1,MPI_REAL_RP,MPI_MAX,MPI_COMM_WORLD,ierr)
             if(myid == 0) print*, 'CHT ',trim(cht_kface),': scalar ',iscal,' largest explicit rate of the off-diagonal term: ',rate
+            kcr_rate(nset) = rate
             if((trim(cht_kcross_scheme) == 'explicit' .or. .not.is_impdiff) .and. rate > 0._rp) &
               dtmax_kcr = min(dtmax_kcr,cht_kcross_cfl/rate)
           end do
@@ -1225,7 +1228,7 @@ program cans
                        is_cht=s%is_cht,alphas=s%alphas,cs_cf=s%cs_cf,ssource_s=s%source_s,cbcz=s%cbc(:,3), &
                        thx=thxt(:,:,:,s%iset),thy=thyt(:,:,:,s%iset),thz=thzt(:,:,:,s%iset),phi=phi_cht, &
                        qw=qw_ibm(iscal),adens=adens,iset=s%iset,kcross=kcr(:,:,:,:,s%iset), &
-                       cbcs=s%cbc,nb=nb,dl=dl,dzc=dzc)
+                       cbcs=s%cbc,nb=nb,dl=dl,dzc=dzc,bcs=s%bc,kcrate=kcr_rate(s%iset))
           end if
         else
         if(is_ibm) then
