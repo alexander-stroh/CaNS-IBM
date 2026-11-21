@@ -41,7 +41,7 @@ module mod_cht
   !
   use mpi
   use mod_common_mpi, only: myid,ierr
-  use mod_param     , only: ipencil_axis,is_impdiff
+  use mod_param     , only: ipencil_axis,is_impdiff,dims
   use mod_types
 #if !defined(_OPENACC)
   use decomp_2d
@@ -72,6 +72,17 @@ module mod_cht
   integer , dimension(3) :: nx_p,ny_p,nz_p               ! shapes of the x-, y- and z-pencil arrays
   integer :: iy_axis                                     ! axis along y in the y-pencil array (1 on GPUs, 2 on CPUs)
   real(rp) :: dxi2,dyi2
+  !
+  ! GPU, direction not decomposed (dims(1) = 1 for x, dims(2) = 1 for y): the lines along that direction lie
+  ! entirely in the z pencil of the task, and the systems are solved there without the transposes: y along the
+  ! second axis of the z pencil, x after a local permutation of its first two axes; face and volume fractions
+  ! of these layouts
+  !
+  logical :: is_loc_x = .false.,is_loc_y = .false.
+  real(rp), allocatable, dimension(:,:,:,:) :: thy_l,thz_l ! (x,y,z), unpadded (the z pencil of the transposes may be padded)
+  real(rp), allocatable, dimension(:,:,:)   :: phi_l
+  real(rp), allocatable, dimension(:,:,:,:) :: thx_s ! (y,x,z)
+  real(rp), allocatable, dimension(:,:,:)   :: phi_s ! (y,x,z)
   contains
   subroutine cht_init(n,ng,l,dzci_g,dzfi_g,thx,thy,thz,phi,scalars,thxt,thyt,thzt)
     use mod_scal, only: scalar
@@ -138,7 +149,89 @@ module mod_cht
     end if
     ipset = 1
     call scatter(n,phi,'phi')
+#if defined(_OPENACC)
+    !
+    ! local line solves in the z pencil (see above)
+    !
+    is_loc_x = dims(1) == 1 .and. n(1) == ng(1)
+    is_loc_y = dims(2) == 1 .and. n(2) == ng(2) .and. is_loc_x
+    if(is_loc_x) then
+      allocate(thx_s(n(2),n(1),n(3),nps),phi_s(n(2),n(1),n(3)))
+      !$acc enter data create(thx_s,phi_s)
+      call store_local(n,phi,phi_s,.true.)
+      do ip=1,nps
+        if(present(thxt)) then
+          call store_local(n,thxt(:,:,:,ip),thx_s(:,:,:,ip),.true.)
+        else
+          call store_local(n,thx,thx_s(:,:,:,ip),.true.)
+        end if
+      end do
+    end if
+    if(is_loc_y) then
+      allocate(thy_l(n(1),n(2),n(3),nps))
+      !$acc enter data create(thy_l)
+      do ip=1,nps
+        if(present(thyt)) then
+          call store_local(n,thyt(:,:,:,ip),thy_l(:,:,:,ip),.false.)
+        else
+          call store_local(n,thy,thy_l(:,:,:,ip),.false.)
+        end if
+      end do
+    end if
+    !$acc wait(1)
+    if(myid == 0) print*, 'CHT line solves without transposes along x, y: ',is_loc_x,is_loc_y
+#endif
+    !
+    ! z line solves directly in the array of the task (z pencils): for the transpose-free path above and for
+    ! scalars with z-implicit diffusion only (`cht_solve` with is_z1d)
+    !
+    if(ipencil_axis == 3) then
+      allocate(thz_l(n(1),n(2),n(3),nps),phi_l(n(1),n(2),n(3)))
+      !$acc enter data create(thz_l,phi_l)
+      call store_local(n,phi,phi_l,.false.)
+      do ip=1,nps
+        if(present(thzt)) then
+          call store_local(n,thzt(:,:,:,ip),thz_l(:,:,:,ip),.false.)
+        else
+          call store_local(n,thz,thz_l(:,:,:,ip),.false.)
+        end if
+      end do
+      !$acc wait(1)
+    end if
   end subroutine cht_init
+  !
+  subroutine store_local(n,q,b,is_swap)
+    !
+    ! interior of the cell-centred field q in the z-pencil layout, b(i,j,k), or permuted, b(j,i,k)
+    !
+    implicit none
+    integer , intent(in) :: n(3)
+    real(rp), intent(in ), dimension(0:,0:,0:) :: q
+    real(rp), intent(out), dimension(:,:,:) :: b
+    logical , intent(in) :: is_swap
+    integer :: i,j,k
+    if(is_swap) then
+      !$acc parallel loop collapse(3) default(present) async(1)
+      !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared)
+      do k=1,n(3)
+        do i=1,n(1)
+          do j=1,n(2)
+            b(j,i,k) = q(i,j,k)
+          end do
+        end do
+      end do
+    else
+      !$acc parallel loop collapse(3) default(present) async(1)
+      !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared)
+      do k=1,n(3)
+        do j=1,n(2)
+          do i=1,n(1)
+            b(i,j,k) = q(i,j,k)
+          end do
+        end do
+      end do
+    end if
+  end subroutine store_local
   !
   subroutine scatter(n,q,task)
     !
@@ -165,10 +258,11 @@ module mod_cht
     !$acc exit data delete(p)
   end subroutine scatter
   !
-  subroutine cht_solve(n,f,alphaf,alphas,cs_cf,cbcz,p,iset)
+  subroutine cht_solve(n,f,alphaf,alphas,cs_cf,cbcz,p,iset,is_z1d)
     !
     ! solves (1 - f*L_x)(1 - f*L_y)(1 - f*L_z) dT = p for one CHT scalar; p holds the right-hand
-    ! side on input and dT on output; dT satisfies homogeneous boundary conditions along z
+    ! side on input and dT on output; dT satisfies homogeneous boundary conditions along z;
+    ! with is_z1d only (1 - f*L_z) dT = p (x and y diffusion explicit, see `rk_scal_cht`; z pencils only)
     !
     implicit none
     integer , intent(in) :: n(3)
@@ -176,8 +270,15 @@ module mod_cht
     character(len=1), intent(in), dimension(0:1) :: cbcz
     real(rp), intent(inout), dimension(:,:,:) :: p
     integer , intent(in), optional :: iset ! face-fraction set (`cht_kface = 'tensor'`: the scalar's; else 0)
+    logical , intent(in), optional :: is_z1d
     ipset = 1
     if(present(iset)) ipset = max(iset,1)
+    if(present(is_z1d)) then
+      if(is_z1d) then
+        call solve_z(n(1),n(2),n(3),f,alphaf,alphas,cs_cf,cbcz(0) == 'D',cbcz(1) == 'D',dzci_c,dzfi_c,thz_l(:,:,:,ipset),phi_l,cwork,p)
+        return
+      end if
+    end if
     call transposes(n,p,'solve',f,alphaf,alphas,cs_cf,cbcz(0) == 'D',cbcz(1) == 'D')
   end subroutine cht_solve
   !
@@ -253,6 +354,15 @@ module mod_cht
     else
       py(1:ny_p(1),1:ny_p(2),1:ny_p(3)) => solver_buf_1(1:product(ny_p(:)))
     end if
+    if(task == 'solve' .and. is_loc_x .and. is_loc_y) then
+      !
+      ! no direction decomposed: all line solves in the z pencil, no transposes (same order, z, y, x)
+      !
+      call solve_z(n(1),n(2),n(3),f,alphaf,alphas,cs_cf,is_d0,is_d1,dzci_c,dzfi_c,thz_l(:,:,:,ipset),phi_l,cwork,p)
+      call solve_periodic_axis2(n(1),n(2),n(3),ngl(2),f*dyi2,alphaf,alphas,cs_cf,thy_l(:,:,:,ipset),phi_l,cwork,uwork,p)
+      call solve_local_x(n,f,alphaf,alphas,cs_cf,p)
+      return
+    end if
     !
     ! the pencils of the Poisson grid descriptor are padded along x and y: clear the buffers first,
     ! so that the line solves in the padded parts never operate on stale (possibly non-finite) data
@@ -269,6 +379,19 @@ module mod_cht
     istat = cudecompTransposeZtoY(ch,gd,pz,py,work,dtype_rp,stream=istream)
     !$acc end host_data
     call visit('y',py)
+    if(task == 'solve' .and. is_loc_x) then
+      !
+      ! x not decomposed: back to the z pencil after the y solve, x solve there
+      !
+      !$acc host_data use_device(py,pz,work)
+      istat = cudecompTransposeYtoZ(ch,gd,py,pz,work,dtype_rp,stream=istream)
+      !$acc end host_data
+      !$acc kernels default(present) async(1)
+      p(1:n(1),1:n(2),1:n(3)) = pz(1:n(1),1:n(2),1:n(3))
+      !$acc end kernels
+      call solve_local_x(n,f,alphaf,alphas,cs_cf,p)
+      return
+    end if
     !$acc host_data use_device(py,px,work)
     istat = cudecompTransposeYtoX(ch,gd,py,px,work,dtype_rp,stream=istream)
     !$acc end host_data
@@ -412,6 +535,20 @@ module mod_cht
     call swap12(np(2),np(1),np(3),pwork,q)
   end subroutine solve_swapped
   !
+  subroutine solve_local_x(n,f,alphaf,alphas,cs_cf,p)
+    !
+    ! x line solves in the z pencil of a task that holds the whole lines (`is_loc_x`): local permutation of the
+    ! first two axes around the solve, as in `solve_swapped`
+    !
+    implicit none
+    integer , intent(in) :: n(3)
+    real(rp), intent(in) :: f,alphaf,alphas,cs_cf
+    real(rp), intent(inout), dimension(n(1),n(2),n(3)) :: p
+    call swap12(n(1),n(2),n(3),p,pwork)
+    call solve_periodic_axis2(n(2),n(1),n(3),ngl(1),f*dxi2,alphaf,alphas,cs_cf,thx_s(:,:,:,ipset),phi_s,cwork,uwork,pwork)
+    call swap12(n(2),n(1),n(3),pwork,p)
+  end subroutine solve_local_x
+  !
   subroutine solve_periodic_axis1(n1,n2,n3,nl,fd,alphaf,alphas,cs_cf,th,phi,cc,uu,p)
     !
     ! cyclic tridiagonal systems along the first array axis (uniform spacing d, fd = f/d**2),
@@ -443,9 +580,8 @@ module mod_cht
         !
         !$acc loop seq
         do i=1,nl
-          im = i-1; if(i == 1) im = nl
+          if(i > 1) km = kp ! lower face = upper face of the previous point (i = 1: face nl, above)
           kp = kface(rf,rs,th(i ,j,k))
-          km = kface(rf,rs,th(im,j,k))
           capi = capinv(cs_cf,phi(i,j,k))
           a = -fd*capi*km
           c = -fd*capi*kp
@@ -508,9 +644,8 @@ module mod_cht
         gam = 0.
         !$acc loop seq
         do j=1,nl
-          jm = j-1; if(j == 1) jm = nl
+          if(j > 1) km = kp ! lower face = upper face of the previous point (j = 1: face nl, above)
           kp = kface(rf,rs,th(i,j ,k))
-          km = kface(rf,rs,th(i,jm,k))
           capi = capinv(cs_cf,phi(i,j,k))
           a = -fd*capi*km
           c = -fd*capi*kp
@@ -577,7 +712,7 @@ module mod_cht
           if(k == 1) then
             km = kface(rf,rs,merge(1._rp,0._rp,phi(i,j,1) >= 0.5_rp))
           else
-            km = kface(rf,rs,th(i,j,k-1))
+            km = kp ! lower face = upper face of the previous cell, th(i,j,k-1)
           end if
           if(k == nz) then
             kp = kface(rf,rs,merge(1._rp,0._rp,phi(i,j,nz) >= 0.5_rp))

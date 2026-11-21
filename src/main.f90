@@ -101,7 +101,9 @@ program cans
                                  set_cht_face_o2
   use mod_ibm_damp       , only: ibm_damp_init
   use mod_param          , only: is_ibm_damp,ibm_damp_d
-  use mod_param          , only: qw_ibm,qw_ibm_eps,cht_kface,cht_kcross_stab,cht_kcross_scheme,cht_kcross_cfl
+  use mod_param          , only: qw_ibm,qw_ibm_eps,cht_kface,cht_kcross_stab,cht_kcross_scheme,cht_kcross_cfl,cht_impdiff_xy, &
+                                 ipencil_axis_ => ipencil_axis
+  use mod_scal           , only: scal_cht_cross_init
 #if !defined(_OPENACC)
   use mod_solver         , only: solver
 #else
@@ -939,6 +941,7 @@ program cans
       !$acc enter data copyin(thxt,thyt,thzt)
       if(allocated(kcr)) then
         !$acc enter data copyin(kcr)
+        call scal_cht_cross_init(n,kcr)
         !
         ! largest explicit rate B of the off-diagonal term (sum of the moduli of its stencil coefficients in a
         ! cell, 1/time); with `cht_kcross_scheme = 'explicit'` (Runge-Kutta slope) or explicit diffusion the
@@ -1100,6 +1103,16 @@ program cans
   end if
 !*****************************
   !
+  ! CHT scalars with z-implicit diffusion only (`cht_impdiff_xy = 'auto'`, see `param`)
+  !
+  if(trim(cht_impdiff_xy) == 'auto' .and. is_impdiff .and. is_impdiff_1d .and. ipencil_axis_ == 3) then
+    do iscal=1,nscal
+      if(.not.scalars(iscal)%is_cht) cycle
+      scalars(iscal)%is_z1d = scalars(iscal)%alpha_max <= max(visc,alpha_max)*(1._rp + 1.e-12_rp)
+      if(myid == 0) print*, 'CHT scalar ',iscal,': z-implicit diffusion only (x, y explicit): ',scalars(iscal)%is_z1d
+    end do
+  end if
+  !
   ! main loop
   !
   if(is_ibm .and. trim(ibm_proj) == 'masked') call mproj_init(n,mask_u,mask_v,mask_w,myid)
@@ -1213,14 +1226,14 @@ program cans
                        s%is_forced,s%scalf,s%source,s%fluxo,s%dsdtrko,s%val,s%f,A_s,B_s, &
                        swz(:,iscal),scal_mean_grad(iscal),mask_s, &
                        is_cht=s%is_cht,alphas=s%alphas,cs_cf=s%cs_cf,ssource_s=s%source_s,cbcz=s%cbc(:,3), &
-                       thx=thx,thy=thy,thz=thz,phi=phi_cht,qw=qw_ibm(iscal),adens=adens)
+                       thx=thx,thy=thy,thz=thz,phi=phi_cht,qw=qw_ibm(iscal),adens=adens,is_z1d=s%is_z1d)
           else if(.not.allocated(kcr)) then ! `cht_kface = 'tensor'`: the scalar's own face fractions (and line-solver set)
           call rk_scal(rkcoeff(:,irk),n,dli,l,dzci,dzfi,grid_vol_ratio_f,s%alpha,dt,is_bound,u,v,w, &
                        s%is_forced,s%scalf,s%source,s%fluxo,s%dsdtrko,s%val,s%f,A_s,B_s, &
                        swz(:,iscal),scal_mean_grad(iscal),mask_s, &
                        is_cht=s%is_cht,alphas=s%alphas,cs_cf=s%cs_cf,ssource_s=s%source_s,cbcz=s%cbc(:,3), &
                        thx=thxt(:,:,:,s%iset),thy=thyt(:,:,:,s%iset),thz=thzt(:,:,:,s%iset),phi=phi_cht, &
-                       qw=qw_ibm(iscal),adens=adens,iset=s%iset)
+                       qw=qw_ibm(iscal),adens=adens,iset=s%iset,is_z1d=s%is_z1d)
           else ! `cht_kface = 'tensor_full'`: also the off-diagonal face conductivities (explicit, see `cht_kcross_scheme`)
           call rk_scal(rkcoeff(:,irk),n,dli,l,dzci,dzfi,grid_vol_ratio_f,s%alpha,dt,is_bound,u,v,w, &
                        s%is_forced,s%scalf,s%source,s%fluxo,s%dsdtrko,s%val,s%f,A_s,B_s, &
@@ -1228,7 +1241,7 @@ program cans
                        is_cht=s%is_cht,alphas=s%alphas,cs_cf=s%cs_cf,ssource_s=s%source_s,cbcz=s%cbc(:,3), &
                        thx=thxt(:,:,:,s%iset),thy=thyt(:,:,:,s%iset),thz=thzt(:,:,:,s%iset),phi=phi_cht, &
                        qw=qw_ibm(iscal),adens=adens,iset=s%iset,kcross=kcr(:,:,:,:,s%iset), &
-                       cbcs=s%cbc,nb=nb,dl=dl,dzc=dzc,bcs=s%bc,kcrate=kcr_rate(s%iset))
+                       cbcs=s%cbc,nb=nb,dl=dl,dzc=dzc,bcs=s%bc,kcrate=kcr_rate(s%iset),is_z1d=s%is_z1d)
           end if
         else
         if(is_ibm) then

@@ -117,6 +117,12 @@ character(len=16), protected :: cht_kface = 'series'
 ! cht_kcross_stab ('douglas', 'craig-sneyd'): extra face conductivity cht_kcross_stab*(bound of the
 ! off-diagonal term) for the line solvers, left-hand side only (0: off; delayed, did not remove, the instability)
 character(len=16), protected :: cht_kcross_scheme = 'explicit'
+!
+! cht_impdiff_xy (CHT scalars with `is_impdiff`): 'always': diffusion implicit in x, y and z (factorized);
+!                'auto': with `is_impdiff_1d` and z pencils, only z implicit (x and y explicit, as for the
+!                velocity) for the scalars whose largest diffusivity k/C does not exceed the viscosity,
+!                i.e. that do not tighten the time step limit of the explicit x-y diffusion
+character(len=16), protected :: cht_impdiff_xy = 'always'
 real(rp), protected :: cht_kcross_cfl = 2._rp
 real(rp), protected :: cht_kcross_stab = 0._rp
 !
@@ -242,7 +248,7 @@ contains
                      cbcscal,bcscal, &
                      cbcscal_ibm,bcscal_ibm,bcscal_ibm_top,&
                      const_scal,scal_mean_grad,&
-                     is_cht,ks_kf,cs_cf,cht_kface,cht_kcross_scheme,cht_kcross_cfl,cht_kcross_stab,&
+                     is_cht,ks_kf,cs_cf,cht_kface,cht_kcross_scheme,cht_kcross_cfl,cht_kcross_stab,cht_impdiff_xy,&
                      qw_ibm,qw_ibm_eps,&
                      ssource,ssource_s, &
                      is_sforced, &

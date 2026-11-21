@@ -10,7 +10,8 @@ module mod_scal
   use mod_solve_helmholtz, only: rhs_bound
   implicit none
   private
-  public scal,scal_cht,scal_cht_diff,scal_cht_cross,scalar,cmpt_scalflux,bulk_forcing_s,initialize_scalars
+  public scal,scal_cht,scal_cht_diff,scal_cht_cross,scal_cht_cross_init,scalar,cmpt_scalflux,bulk_forcing_s,initialize_scalars
+  logical, allocatable, dimension(:,:) :: kc_act ! z levels where the off-diagonal term of a face set can be nonzero
   !
   ! scalar derived type
   !
@@ -22,6 +23,7 @@ module mod_scal
     real(rp) :: alphas    ! solid conductivity over the fluid heat capacity (= alpha*ks_kf)
     real(rp) :: cs_cf     ! solid-to-fluid volumetric heat capacity ratio
     integer  :: iset = 0  ! CHT face-fraction set (0: geometric thx/thy/thz; > 0: `cht_kface = 'tensor'`)
+    logical  :: is_z1d = .false. ! CHT with implicit diffusion: only z implicit, x and y explicit (`cht_impdiff_xy = 'auto'`)
     real(rp) :: alpha_max ! largest effective diffusivity (conductivity over heat capacity)
     character(len=100) :: ini
     character(len=1), dimension(0:1,3) :: cbc
@@ -324,7 +326,7 @@ module mod_scal
     end if
   end subroutine bulk_forcing_s
   !
-  subroutine scal_cht(nx,ny,nz,dxi,dyi,dzci,dzfi,alphaf,alphas,cs_cf,u,v,w,thx,thy,thz,phi,s,dsdt,dsdtd)
+  subroutine scal_cht(nx,ny,nz,dxi,dyi,dzci,dzfi,alphaf,alphas,cs_cf,u,v,w,thx,thy,thz,phi,s,dsdt,dsdtd,is_z1d)
     use mod_param, only: is_impdiff
     !
     ! computes convective and diffusive fluxes of a scalar with conjugate heat transfer (CHT), i.e.,
@@ -342,7 +344,8 @@ module mod_scal
     ! fluid cell centre to the interface over the segment length, so that the flux is continuous at the
     ! exact interface position; th = 1/2 reduces to the harmonic mean, interface at the cell face)
     ! with implicit diffusion (`is_impdiff`), the full (variable-coefficient) diffusion is returned
-    ! in `dsdtd` and treated implicitly in all directions by `mod_cht`
+    ! in `dsdtd` and treated implicitly in all directions by `mod_cht`; with is_z1d only the z diffusion is
+    ! returned in `dsdtd`, and the x and y diffusion is added to the explicit slope `dsdt`
     !
     implicit none
     integer , intent(in) :: nx,ny,nz
@@ -351,7 +354,9 @@ module mod_scal
     real(rp), dimension(0:,0:,0:), intent(in) :: u,v,w,s,thx,thy,thz,phi
     real(rp), dimension(:,:,:), intent(out) :: dsdt
     real(rp), dimension(:,:,:), intent(out), optional :: dsdtd
+    logical , intent(in), optional :: is_z1d
     integer :: i,j,k
+    logical :: is_1d
     real(rp) :: usip,usim,vsjp,vsjm,wskp,wskm
     real(rp) :: dsdxp,dsdxm,dsdyp,dsdym,dsdzp,dsdzm
     real(rp) :: kxp,kxm,kyp,kym,kzp,kzm
@@ -359,6 +364,8 @@ module mod_scal
     !
     rf = 1./alphaf
     rs = 1./alphas
+    is_1d = .false.
+    if(present(is_z1d)) is_1d = is_z1d
     !$acc parallel loop collapse(3) default(present) &
     !$acc private(usip,usim,vsjp,vsjm,wskp,wskm,dsdxp,dsdxm,dsdyp,dsdym,dsdzp,dsdzm) &
     !$acc private(kxp,kxm,kyp,kym,kzp,kzm,capi,diff_xy,diff_z) async(1)
@@ -398,7 +405,12 @@ module mod_scal
                       (kyp*dsdyp-kym*dsdym)*dyi )*capi
           diff_z  = (kzp*dsdzp-kzm*dsdzm)*dzfi(k)*capi
           if(is_impdiff) then
-            dsdtd(i,j,k) = diff_xy + diff_z
+            if(is_1d) then
+              dsdt(i,j,k)  = dsdt(i,j,k) + diff_xy
+              dsdtd(i,j,k) = diff_z
+            else
+              dsdtd(i,j,k) = diff_xy + diff_z
+            end if
           else
             dsdt(i,j,k)  = dsdt(i,j,k) + diff_xy + diff_z
           end if
@@ -407,7 +419,7 @@ module mod_scal
     end do
   end subroutine scal_cht
   !
-  subroutine scal_cht_diff(nx,ny,nz,dxi,dyi,dzci,dzfi,alphaf,alphas,cs_cf,thx,thy,thz,phi,s,dsdtd)
+  subroutine scal_cht_diff(nx,ny,nz,dxi,dyi,dzci,dzfi,alphaf,alphas,cs_cf,thx,thy,thz,phi,s,dsdtd,is_z1d)
     !
     ! diffusion of a scalar with conjugate heat transfer only (the `dsdtd` of `scal_cht` with `is_impdiff`),
     ! for the re-evaluations between the sub-iterations of `cht_kcross_scheme = 'subcycle'` (see `rk_scal_cht`)
@@ -418,13 +430,17 @@ module mod_scal
     real(rp), intent(in), dimension(0:) :: dzci,dzfi
     real(rp), dimension(0:,0:,0:), intent(in) :: s,thx,thy,thz,phi
     real(rp), dimension(:,:,:), intent(out) :: dsdtd
+    logical , intent(in), optional :: is_z1d ! only the z diffusion
     integer :: i,j,k
+    logical :: is_1d
     real(rp) :: dsdxp,dsdxm,dsdyp,dsdym,dsdzp,dsdzm
     real(rp) :: kxp,kxm,kyp,kym,kzp,kzm
     real(rp) :: capi,diff_xy,diff_z,rf,rs
     !
     rf = 1./alphaf
     rs = 1./alphas
+    is_1d = .false.
+    if(present(is_z1d)) is_1d = is_z1d
     !$acc parallel loop collapse(3) default(present) &
     !$acc private(dsdxp,dsdxm,dsdyp,dsdym,dsdzp,dsdzm,kxp,kxm,kyp,kym,kzp,kzm,capi,diff_xy,diff_z) async(1)
     !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared) &
@@ -448,13 +464,31 @@ module mod_scal
           diff_xy = ( (kxp*dsdxp-kxm*dsdxm)*dxi + &
                       (kyp*dsdyp-kym*dsdym)*dyi )*capi
           diff_z  = (kzp*dsdzp-kzm*dsdzm)*dzfi(k)*capi
+          if(is_1d) diff_xy = 0.
           dsdtd(i,j,k) = diff_xy + diff_z
         end do
       end do
     end do
   end subroutine scal_cht_diff
   !
-  subroutine scal_cht_cross(nx,ny,nz,dxi,dyi,dzci,dzfi,cs_cf,phi,kc,s,dsdt)
+  subroutine scal_cht_cross_init(n,kc)
+    !
+    ! z levels with a nonzero off-diagonal face conductivity (per face set), where `scal_cht_cross` has work to do
+    !
+    implicit none
+    integer , intent(in) :: n(3)
+    real(rp), intent(in), dimension(0:,0:,0:,:,:) :: kc
+    integer :: k,is
+    allocate(kc_act(n(3),size(kc,5)))
+    do is=1,size(kc,5)
+      do k=1,n(3)
+        kc_act(k,is) = any(kc(0:n(1),0:n(2),k-1:k,:,is) /= 0._rp)
+      end do
+    end do
+    !$acc enter data copyin(kc_act)
+  end subroutine scal_cht_cross_init
+  !
+  subroutine scal_cht_cross(nx,ny,nz,dxi,dyi,dzci,dzfi,cs_cf,phi,kc,s,dsdt,iset)
     !
     ! off-diagonal part of the face conductivity tensor of a CHT scalar (`cht_kface = 'tensor_full'`),
     ! added explicitly to dsdt: with the effective tensor of a locally planar interface,
@@ -476,13 +510,23 @@ module mod_scal
     real(rp), intent(in), dimension(0:,0:,0:) :: phi,s
     real(rp), intent(in), dimension(0:,0:,0:,:) :: kc
     real(rp), intent(inout), dimension(:,:,:) :: dsdt
-    integer :: i,j,k
+    integer , intent(in), optional :: iset ! face set: the z levels without off-diagonal conductivities are skipped
+    integer :: i,j,k,is
     real(rp) :: fxp,fxm,fyp,fym,fzp,fzm,dzi2,capi
+    if(.not.allocated(kc_act)) then ! not initialized (`scal_cht_cross_init`): all levels
+      allocate(kc_act(nz,1))
+      kc_act(:,:) = .true.
+      !$acc enter data copyin(kc_act)
+    end if
+    is = 1
+    if(present(iset)) is = min(max(iset,1),size(kc_act,2))
+    if(.not.any(kc_act(:,is))) return
     !$acc parallel loop collapse(3) default(present) private(fxp,fxm,fyp,fym,fzp,fzm,dzi2,capi) async(1)
     !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared) PRIVATE(fxp,fxm,fyp,fym,fzp,fzm,dzi2,capi)
     do k=1,nz
       do j=1,ny
         do i=1,nx
+          if(.not.kc_act(k,is)) cycle
           dzi2 = 1._rp/(1._rp/dzci(k-1) + 1._rp/dzci(k)) ! 1/(z(k+1)-z(k-1))
           fxp = kc(i  ,j,k,1)*(s(i  ,j+1,k)+s(i+1,j+1,k)-s(i  ,j-1,k)-s(i+1,j-1,k))*.25_rp*dyi + &
                 kc(i  ,j,k,2)*(s(i  ,j,k+1)+s(i+1,j,k+1)-s(i  ,j,k-1)-s(i+1,j,k-1))*.5_rp*dzi2

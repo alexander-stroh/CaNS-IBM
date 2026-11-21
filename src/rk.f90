@@ -454,7 +454,7 @@ module mod_rk
   subroutine rk_scal(rkpar,n,dli,l,dzci,dzfi,grid_vol_ratio_f,alpha,dt,is_bound,u,v,w, &
                      is_forced,scalf,ssource,fluxo,dsdtrko,s,f,A_s,B_s,sw,sgrad,mask_s, &
                      is_cht,alphas,cs_cf,cbcz,thx,thy,thz,phi,ssource_s,qw,adens,iset,kcross, &
-                     cbcs,nb,dl,dzc,bcs,kcrate)
+                     cbcs,nb,dl,dzc,bcs,kcrate,is_z1d)
 #if defined(_OPENACC)
     use mod_common_cudecomp, only: dsdtrk_t => work
 #endif
@@ -517,6 +517,7 @@ module mod_rk
     real(rp), intent(in), dimension(0:), optional :: dzc
     real(rp), intent(in), dimension(0:1,3), optional :: bcs ! boundary values (`cht_kcross_scheme = 'subcycle'`)
     real(rp), intent(in), optional :: kcrate                ! largest explicit rate of the off-diagonal term
+    logical , intent(in), optional :: is_z1d                ! CHT, implicit diffusion: only z implicit, x and y explicit
     real(rp), intent(in), optional :: qw
     real(rp), intent(in), dimension(0:,0:,0:), optional :: adens
     logical  :: is_cht_
@@ -576,11 +577,11 @@ module mod_rk
       if(qw_ /= 0._rp) then
         call rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas,cs_cf,ssource,ssource_s_,sgrad, &
                          is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_,adens,iset_,kcross, &
-                         cbcs,nb,dl,dzc,is_bound,bcs,kcrate)
+                         cbcs,nb,dl,dzc,is_bound,bcs,kcrate,is_z1d)
       else
         call rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas,cs_cf,ssource,ssource_s_,sgrad, &
                          is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_,phi,iset_,kcross, & ! adens unused
-                         cbcs,nb,dl,dzc,is_bound,bcs,kcrate)
+                         cbcs,nb,dl,dzc,is_bound,bcs,kcrate,is_z1d)
       end if
       return
     end if
@@ -694,7 +695,7 @@ module mod_rk
   !
   subroutine rk_scal_cht(n,dli,dzci,dzfi,grid_vol_ratio_f,factor1,factor2,factor12,alpha,alphas_in,cs_cf_in,ssource_in,ssource_s_in,sgrad_in, &
                          is_forced,scalf,u,v,w,thx,thy,thz,phi,cbcz,dsdtrk,dsdtrkd,dsdtrko,s,f,qw_in,adens,iset,kcross, &
-                         cbcs,nb,dl,dzc,is_bnd,bcs,kcrate)
+                         cbcs,nb,dl,dzc,is_bnd,bcs,kcrate,is_z1d)
     !
     ! Runge-Kutta substep of a scalar with conjugate heat transfer (see `rk_scal`, `scal_cht`, `mod_cht`);
     ! the scalar inputs are copied to locals, so that the asynchronous device loops only reference
@@ -725,16 +726,20 @@ module mod_rk
     logical , intent(in), dimension(0:1,3), optional :: is_bnd
     real(rp), intent(in), dimension(0:1,3), optional :: bcs ! boundary values (halos between the sub-iterations)
     real(rp), intent(in), optional :: kcrate                ! largest explicit rate of the off-diagonal term
+    logical , intent(in), optional :: is_z1d                ! CHT, implicit diffusion: only z implicit, x and y explicit
     real(rp), allocatable, dimension(:,:,:), save :: dth ! dT with halos (Craig-Sneyd correction)
     real(rp), allocatable, dimension(:,:,:), save :: asub ! explicit part of a sub-iteration ('subcycle')
     integer :: nsub,isub
+    logical :: is_1d
     real(rp) :: fsub
     real(rp), dimension(0:1,3) :: bc0
     real(rp) :: alphas,cs_cf,ss,sss,f1,f2,f12,capi,mean,qw,sg
     integer :: i,j,k
     alphas = alphas_in; cs_cf = cs_cf_in; ss = ssource_in; sss = ssource_s_in; qw = qw_in; sg = sgrad_in
     f1 = factor1; f2 = factor2; f12 = factor12
-    call scal_cht(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,alpha,alphas,cs_cf,u,v,w,thx,thy,thz,phi,s,dsdtrk,dsdtrkd)
+    is_1d = .false.
+    if(present(is_z1d)) is_1d = is_z1d .and. is_impdiff
+    call scal_cht(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,alpha,alphas,cs_cf,u,v,w,thx,thy,thz,phi,s,dsdtrk,dsdtrkd,is_1d)
     if(trim(ibm_updiss_mode) /= 'none') call scal_updiss_cht(n,dli,cs_cf,phi,u,v,w,s,dsdtrk) ! upwind dissipation near the interface
     if(present(kcross)) then
       !
@@ -746,9 +751,9 @@ module mod_rk
       ! corrected after the solve (below)
       !
       if(is_impdiff .and. trim(cht_kcross_scheme) /= 'explicit') then
-        call scal_cht_cross(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,cs_cf,phi,kcross,s,dsdtrkd)
+        call scal_cht_cross(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,cs_cf,phi,kcross,s,dsdtrkd,iset)
       else
-        call scal_cht_cross(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,cs_cf,phi,kcross,s,dsdtrk)
+        call scal_cht_cross(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,cs_cf,phi,kcross,s,dsdtrk,iset)
       end if
     end if
     if(.not.const_scal) then
@@ -809,7 +814,7 @@ module mod_rk
             end do
           end do
         end do
-        call cht_solve(n,0.5_rp*fsub,alpha,alphas,cs_cf,cbcz,dsdtrkd,iset)
+        call cht_solve(n,0.5_rp*fsub,alpha,alphas,cs_cf,cbcz,dsdtrkd,iset,is_1d)
         !$acc parallel loop collapse(3) default(present) async(1)
         !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared)
         do k=1,n(3)
@@ -821,8 +826,8 @@ module mod_rk
         end do
         if(isub < nsub) then
           call boundp(cbcs,n,bcs,nb,is_bnd,dl,dzc,s)
-          call scal_cht_diff(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,alpha,alphas,cs_cf,thx,thy,thz,phi,s,dsdtrkd)
-          call scal_cht_cross(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,cs_cf,phi,kcross,s,dsdtrkd)
+          call scal_cht_diff(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,alpha,alphas,cs_cf,thx,thy,thz,phi,s,dsdtrkd,is_1d)
+          call scal_cht_cross(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,cs_cf,phi,kcross,s,dsdtrkd,iset)
         end if
       end do
     else if(is_impdiff) then
@@ -843,7 +848,7 @@ module mod_rk
           end do
         end do
       end do
-      call cht_solve(n,0.5_rp*f12,alpha,alphas,cs_cf,cbcz,dsdtrkd,iset)
+      call cht_solve(n,0.5_rp*f12,alpha,alphas,cs_cf,cbcz,dsdtrkd,iset,is_1d)
       !$acc parallel loop collapse(3) default(present) async(1)
       !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared)
       do k=1,n(3)
