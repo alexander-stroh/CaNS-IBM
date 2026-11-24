@@ -3,6 +3,7 @@ module mod_ibm
     use mod_param
     use mod_thakkar
     use mod_ibm_sdf, only: frac_q,sdf_stag,sdf_point,sdf_taylor,sdf_taylor_eval
+    use mod_cht_tang, only: cht_tang_t,block_offset
     use decomp_2d, only: update_halo
     implicit none
     !
@@ -1999,7 +2000,7 @@ module mod_ibm
         !$acc update device(wf_imp)
     end subroutine calc_wall_force
     !
-    subroutine calc_wall_heat(m,nscal,n,lo,ng,is_per,dl,dzc,dzf,mask_s,thx,thy,thz,s,kf,ks,is_cht,tw)
+    subroutine calc_wall_heat(m,nscal,n,lo,ng,is_per,dl,dzc,dzf,mask_s,thx,thy,thz,s,kf,ks,is_cht,tw,tang)
         !
         ! wall heat flux of scalar m per cell (`FV-heat` output), from the diffusive fluxes of the
         ! discretisation across the centre-to-centre segments cut by the interface (fluid centre f, solid
@@ -2012,6 +2013,9 @@ module mod_ibm
         !    the solid side
         !  - no CHT: the 2nd-order IBM, a linear profile from the fluid node to the wall value T_w at the
         !    distance th*h:  q = k_f*(T_f - T_w)/(th*h),  T_i = T_w
+        !  - with the tangential face flux (`is_cht_tang`, `tang` present): q also carries the tangential part of
+        !    the face flux, (k_area-k_face)*s_t from the face list, so that q is the heat the solver exchanges
+        !    (T_i stays the series point relation)
         ! the heat flow q*A_face goes to the cell that contains the interface point; accumulated in
         ! wh_q(:,:,:,3*m-2:3*m) = [heat flow, T_i*A_face, A_face]; segments from the local cells 1..n to
         ! their + neighbour (that across the domain boundary only if periodic), so that each counts once
@@ -2027,9 +2031,22 @@ module mod_ibm
         real(rp), intent(in)                      :: kf,ks
         real(rp), intent(in), dimension(0:)       :: tw ! wall value per level k
         logical , intent(in)                      :: is_cht
+        type(cht_tang_t), intent(in), optional    :: tang
         real(rp), parameter :: eps = 1.e-10_rp
-        integer  :: ax,i,j,k,ie(3),imax(3),f(3),sc(3),o(3),mc
-        real(rp) :: th,h,af,dface,q,ti
+        integer  :: ax,i,j,k,ie(3),imax(3),f(3),sc(3),o(3),mc,mf,mb,ib,jb,kb
+        real(rp) :: th,h,af,dface,q,ti,st
+        integer, allocatable, dimension(:,:,:,:) :: fmap
+        !
+        ! the faces with a tangential term, by their lower cell (local) and axis
+        !
+        if(present(tang)) then
+            allocate(fmap(n(1),n(2),n(3),3)); fmap(:,:,:,:) = 0
+            do mf=1,tang%nf
+                i = tang%fijk(1,mf); j = tang%fijk(2,mf); k = tang%fijk(3,mf)
+                if(i >= 1 .and. i <= n(1) .and. j >= 1 .and. j <= n(2) .and. k >= 1 .and. k <= n(3)) &
+                    fmap(i,j,k,tang%fijk(4,mf)) = mf
+            end do
+        end if
         if(.not.allocated(wh_q)) then
             allocate(wh_q(0:n(1)+1,0:n(2)+1,0:n(3)+1,3*nscal))
             wh_q(:,:,:,:) = 0._rp
@@ -2056,6 +2073,19 @@ module mod_ibm
                         if(is_cht) then
                             q  = (s(f(1),f(2),f(3))-s(sc(1),sc(2),sc(3)))/(th*h/kf + (1._rp-th)*h/ks)
                             ti = s(f(1),f(2),f(3)) - q*th*h/kf
+                            if(present(tang)) then
+                                mf = fmap(i,j,k,ax)
+                                if(mf > 0) then
+                                    ! the face's k dT/dx_ax part (k_area-k_face) s_t; into the wall (from the
+                                    ! fluid) it counts with + where the lower cell (i,j,k) is the solid one
+                                    st = 0._rp
+                                    do mb=1,18
+                                        call block_offset(mb,ax,ib,jb,kb)
+                                        st = st + tang%fc(mb,mf)*s(i+ib,j+jb,k+kb)
+                                    end do
+                                    q = q + merge(st,-st,mask_s(i,j,k))
+                                end if
+                            end if
                         else
                             th = max(th,eps)
                             q  = kf*(s(f(1),f(2),f(3))-tw(sc(3)))/(th*h)

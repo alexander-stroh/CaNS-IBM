@@ -50,6 +50,7 @@ module mod_cht_tang
   implicit none
   private
   public cht_tang_t,cht_tang_setup,cht_tang_apply,cht_tang_dump,cht_rkl2_stages,cht_sdf_read_halo,cht_halo_width,cht_zw
+  public block_offset
   !
   type cht_tang_t
     integer :: nf = 0                                  ! faces with a tangential term (this rank)

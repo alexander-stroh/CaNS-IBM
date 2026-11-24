@@ -1511,8 +1511,13 @@ program cans
       if(is_wall_heat) then
         do iscal=1,nscal
           s => scalars(iscal)
-          call calc_wall_heat(iscal,nscal,n,lo,ng,is_per,dl,dzc,dzf,mask_s,thx,thy,thz,s%val, &
-                              s%alpha,s%alphas,s%is_cht,swz(:,iscal))
+          if(s%is_tang) then
+            call calc_wall_heat(iscal,nscal,n,lo,ng,is_per,dl,dzc,dzf,mask_s,thx,thy,thz,s%val, &
+                                s%alpha,s%alphas,s%is_cht,swz(:,iscal),tang=ctang(iscal))
+          else
+            call calc_wall_heat(iscal,nscal,n,lo,ng,is_per,dl,dzc,dzf,mask_s,thx,thy,thz,s%val, &
+                                s%alpha,s%alphas,s%is_cht,swz(:,iscal))
+          end if
         end do
         call wall_heat_out(n,lo,nscal,mask_s,frifv,frhout,qwall)
         call write_fv_rows(trim(datadir)//'FV-heat_'//trim(mpiranknum)//'_s_'//fldnum//'.out',frhout)
