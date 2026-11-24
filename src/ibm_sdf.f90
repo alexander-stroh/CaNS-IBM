@@ -32,7 +32,7 @@ module mod_ibm_sdf
   implicit none
   private
   public sdf_read,sdf_staggered,sdf_mask,set_ibm_2nd_sdf,calc_grad_dist_sdf,set_cht_geometry_sdf
-  public frac_q,sdf_stag,sdf_point,sdf_taylor,sdf_taylor_eval
+  public frac_q,sdf_stag,sdf_point,sdf_taylor,sdf_taylor_eval,fluid_length
   public sdf_interface_density
   contains
   subroutine sdf_read(fname,ng,lo,n,zc,ps)

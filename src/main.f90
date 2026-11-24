@@ -95,6 +95,9 @@ program cans
   use mod_stats3d        , only: stats3d_init,stats3d_update,stats3d_save
   use mod_solve_helmholtz, only: solve_helmholtz,solve_helmholtz_ibm,rhs_bound
   use mod_cht            , only: cht_init
+  use mod_cht_tang       , only: cht_tang_t,cht_tang_setup,cht_tang_dump,cht_rkl2_stages,cht_sdf_read_halo,cht_halo_width, &
+                                 cht_zw
+  use mod_cht_rkl2       , only: cht_rkl2_step
   use mod_ibm_sdf        , only: sdf_read,sdf_staggered,sdf_mask,set_ibm_2nd_sdf,calc_grad_dist_sdf, &
                                  set_cht_geometry_sdf,sdf_interface_density
   use mod_ibm_damp       , only: ibm_damp_init
@@ -249,6 +252,15 @@ program cans
   real(rp), allocatable, dimension(:,:,:) :: thx,thy,thz,phi_cht
   logical  :: is_cht_any
   real(rp) :: alpha_max_eff
+  ! CHT scalars with RKL2 (`is_cht_rkl2`) and the tangential face flux (`is_cht_tang`, see `mod_cht_tang`):
+  ! per scalar the face lists and the Gershgorin bound; the level set with the halo the set-up needs
+  logical  :: is_rkl2_any,is_tang_any
+  type(cht_tang_t), allocatable, dimension(:) :: ctang
+  real(rp), allocatable, dimension(:,:,:) :: ps_w
+  real(rp), allocatable, dimension(:) :: zw
+  integer  :: nh_w(3),ns_rkl2
+  integer, allocatable, dimension(:) :: ns_rkl2_last ! per scalar, for the printout
+  character(len=3) :: cscal
   ! interfacial heat flux of CHT scalars (`qw_ibm`): interface area per unit volume at the cell centres
   real(rp), allocatable, dimension(:,:,:) :: adens
   real(rp) :: area_ib
@@ -349,7 +361,15 @@ program cans
   ! (inside the solid of CHT scalars: conductivity over heat capacity)
   !
   alpha_max_eff = alpha_max
-  if(nscal > 0 .and. .not.is_impdiff) alpha_max_eff = max(alpha_max,maxval(scalars(:)%alpha_max))
+  if(nscal > 0 .and. .not.is_impdiff) alpha_max_eff = max(alpha_max,maxval(scalars(:)%alpha_max,mask=.not.scalars(:)%is_rkl2))
+  is_rkl2_any = .false.; is_tang_any = .false.
+  if(nscal > 0) is_rkl2_any = any(scalars(:)%is_rkl2)
+  if(nscal > 0) is_tang_any = any(scalars(:)%is_tang)
+  if(is_tang_any .and. .not.(is_ibm .and. is_sdf)) then
+    if(myid == 0) print*, 'ERROR: `is_cht_tang` needs the level-set geometry (is_ibm = T, geometry = ''sdf'').'
+    call MPI_FINALIZE(ierr)
+    error stop
+  end if
   !
   if(use_hmap)then
     call read_thakkar_nfo(myid)
@@ -844,6 +864,32 @@ program cans
   end if
   !$acc enter data copyin(adens)
   !
+  ! CHT scalars with RKL2 (`is_cht_rkl2`): the Gershgorin bound of the conduction operator and, with
+  ! `is_cht_tang`, the face lists of the tangential flux (`mod_cht_tang`); the set-up reads the level set with
+  ! the halo its frame window needs
+  !
+  if(is_rkl2_any) then
+    allocate(ctang(nscal),ns_rkl2_last(nscal)); ns_rkl2_last(:) = -1
+    call cht_halo_width(dl,dzc_g,ng,nh_w)
+    allocate(zw(1-nh_w(3):n(3)+nh_w(3)))
+    allocate(ps_w(1-nh_w(1):n(1)+nh_w(1),1-nh_w(2):n(2)+nh_w(2),1-nh_w(3):n(3)+nh_w(3)))
+    if(is_tang_any) then
+      call cht_sdf_read_halo(sdf_file,ng,lo,n,nh_w,zc_g,ps_w,zw)
+    else
+      call cht_zw(ng,lo,n,nh_w,zc_g,zw)
+      ps_w(:,:,:) = 1._rp ! unused without the tangential term
+    end if
+    do iscal=1,nscal
+      if(.not.scalars(iscal)%is_rkl2) cycle
+      call cht_tang_setup(n,lo,ng,nh_w,dl,dzf,ps_w,zw,thx,thy,thz,phi_cht,scalars(iscal)%alpha, &
+                          scalars(iscal)%alphas,scalars(iscal)%cs_cf,scalars(iscal)%is_tang,scalars(iscal)%is_guard, &
+                          cht_tang_cap,iscal,ctang(iscal))
+      !$acc enter data copyin(ctang(iscal)%cijk,ctang(iscal)%cf,ctang(iscal)%fijk,ctang(iscal)%fc)
+    end do
+    deallocate(ps_w)
+    if(myid == 0) print*, '*** CHT RKL2 / tangential face flux set up ***'
+  end if
+  !
   ! optional output of the IBM/CHT geometry fields (interior cells, x fastest, serial runs only)
   !
   if(dump_ibm_geometry .and. is_ibm)then
@@ -854,6 +900,12 @@ program cans
       if(is_cht_any) write(iunit) thx(1:n(1),1:n(2),1:n(3)),thy(1:n(1),1:n(2),1:n(3)), &
                                   thz(1:n(1),1:n(2),1:n(3)),phi_cht(1:n(1),1:n(2),1:n(3))
       close(iunit)
+      do iscal=1,nscal
+        if(.not.scalars(iscal)%is_tang) cycle
+        write(cscal,'(i3.3)') iscal
+        call cht_tang_dump(trim(datadir)//'cht_tang_'//cscal//'.bin',n,ctang(iscal))
+        if(myid == 0) print*, '*** CHT tangential face list written to data/cht_tang_'//cscal//'.bin ***'
+      end do
       if(myid == 0) print*, '*** IBM geometry written to data/ibm_geometry.bin (lap_u,v,w,s; thx,y,z,phi) ***'
     else
       if(myid == 0) print*, 'Warning: `dump_ibm_geometry` is only supported for serial runs.'
@@ -946,6 +998,10 @@ program cans
       imp_map(:,:,:)  = 0.
       !$acc update device(imp_map)
     end if
+    !
+    ! CHT scalars with RKL2: the first half step of the conduction (Strang splitting around the Runge-Kutta step)
+    !
+    if(is_rkl2_any) call cht_rkl2_half()
     do irk=1,3
       dtrk = sum(rkcoeff(:,irk))*dt
       dtrki = dtrk**(-1)
@@ -1031,7 +1087,8 @@ program cans
                        s%is_forced,s%scalf,s%source,s%fluxo,s%dsdtrko,s%val,s%f,A_s,B_s, &
                        swz(:,iscal),scal_mean_grad(iscal),mask_s, &
                        is_cht=s%is_cht,alphas=s%alphas,cs_cf=s%cs_cf,ssource_s=s%source_s,cbcz=s%cbc(:,3), &
-                       thx=thx,thy=thy,thz=thz,phi=phi_cht,qw=qw_ibm(iscal),adens=adens)
+                       thx=thx,thy=thy,thz=thz,phi=phi_cht,qw=qw_ibm(iscal),adens=adens, &
+                       is_rkl2=s%is_rkl2,is_convmask=s%is_convmask)
         else
         if(is_ibm) then
           call timer_tic('ibm_calc_a_b',nvtx_color='r',nvtx_gpu_stream=-1)
@@ -1216,6 +1273,7 @@ program cans
       call updatep(n,dli,dzci,dzfi,alpha,pp,p)
       call boundp(cbcpre,n,bcpre,nb,is_bound,dl,dzc,p)
     end do
+    if(is_rkl2_any) call cht_rkl2_half() ! the second half step of the conduction
     dti_step    = dti
     dpdl(:)     = -dpdl(:)*dti
     fs(1:nscal) = fs(1:nscal)*dti
@@ -1586,4 +1644,29 @@ program cans
 #endif
   call MPI_FINALIZE(ierr)
   if(kill) error stop 1 ! aborted run (time step too small, divergence, non-finite scalar): non-zero exit status
+  contains
+  subroutine cht_rkl2_half()
+    !
+    ! half a time step of RKL2 for every CHT scalar with `is_cht_rkl2`: the conduction and the sources
+    ! (`mod_cht_rkl2`); the stage count from dt/2 and the Gershgorin bound of the scalar's operator
+    !
+    integer :: is_
+    type(scalar), pointer :: sp
+    do is_=1,nscal
+      if(.not.scalars(is_)%is_rkl2) cycle
+      sp => scalars(is_)
+      ns_rkl2 = cht_rkl2_stages(0.5_rp*dt*ctang(is_)%gersh)
+      if(sp%qw /= 0._rp) then
+        call cht_rkl2_step(n,dli,dl,dzci,dzfi,dzc,sp%cbc,sp%bc,nb,is_bound,0.5_rp*dt,ns_rkl2,sp%alpha,sp%alphas, &
+                           sp%cs_cf,sp%source,sp%source_s,sp%qw,adens,thx,thy,thz,phi_cht,sp%is_tang,ctang(is_),sp%val)
+      else
+        call cht_rkl2_step(n,dli,dl,dzci,dzfi,dzc,sp%cbc,sp%bc,nb,is_bound,0.5_rp*dt,ns_rkl2,sp%alpha,sp%alphas, &
+                           sp%cs_cf,sp%source,sp%source_s,0._rp,phi_cht,thx,thy,thz,phi_cht,sp%is_tang,ctang(is_),sp%val)
+      end if
+      if(myid == 0 .and. (istep == 1 .or. mod(istep,max(iout0d,1)) == 0) .and. ns_rkl2 /= ns_rkl2_last(is_)) &
+        print'(a,i3,a,i5,a,es12.5)', ' CHT scalar',is_,': RKL2 stages per half step',ns_rkl2,', dt*G/2 =', &
+                                     0.5_rp*dt*ctang(is_)%gersh
+      ns_rkl2_last(is_) = ns_rkl2
+    end do
+  end subroutine cht_rkl2_half
 end program cans

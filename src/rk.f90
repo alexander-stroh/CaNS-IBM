@@ -450,7 +450,7 @@ module mod_rk
   !
   subroutine rk_scal(rkpar,n,dli,l,dzci,dzfi,grid_vol_ratio_f,alpha,dt,is_bound,u,v,w, &
                      is_forced,scalf,ssource,fluxo,dsdtrko,s,f,A_s,B_s,sw,sgrad,mask_s, &
-                     is_cht,alphas,cs_cf,cbcz,thx,thy,thz,phi,ssource_s,qw,adens)
+                     is_cht,alphas,cs_cf,cbcz,thx,thy,thz,phi,ssource_s,qw,adens,is_rkl2,is_convmask)
 #if defined(_OPENACC)
     use mod_common_cudecomp, only: dsdtrk_t => work
 #endif
@@ -506,7 +506,9 @@ module mod_rk
     real(rp), intent(in), dimension(0:,0:,0:), optional :: thx,thy,thz,phi
     real(rp), intent(in), optional :: qw
     real(rp), intent(in), dimension(0:,0:,0:), optional :: adens
-    logical  :: is_cht_
+    logical , intent(in), optional :: is_rkl2     ! CHT: conduction advanced by RKL2 outside the Runge-Kutta step
+    logical , intent(in), optional :: is_convmask ! CHT: no convection through faces between materials (needs mask_s)
+    logical  :: is_cht_,is_rkl2_,is_convmask_
     real(rp) :: qw_
     !
     is_cht_ = .false.
@@ -555,6 +557,24 @@ module mod_rk
       !
       ! all device loops of the CHT update work on non-optional dummy arguments (see `rk_scal_cht`)
       !
+      is_rkl2_ = .false.
+      if(present(is_rkl2)) is_rkl2_ = is_rkl2
+      if(is_rkl2_) then
+        !
+        ! the conduction and the sources are advanced by RKL2 around the Runge-Kutta step (`mod_cht_rkl2`):
+        ! here the convection only
+        !
+        is_convmask_ = .false.
+        if(present(is_convmask)) is_convmask_ = is_convmask
+        if(is_convmask_ .and. present(mask_s)) then
+          call rk_scal_cht_conv(n,dli,dzfi,grid_vol_ratio_f,factor1,factor2,cs_cf,is_forced,scalf,u,v,w,phi, &
+                                dsdtrk,dsdtrko,s,f,mask_s)
+        else
+          call rk_scal_cht_conv(n,dli,dzfi,grid_vol_ratio_f,factor1,factor2,cs_cf,is_forced,scalf,u,v,w,phi, &
+                                dsdtrk,dsdtrko,s,f)
+        end if
+        return
+      end if
       qw_ = 0._rp
       if(present(qw).and.present(adens)) qw_ = qw
       if(qw_ /= 0._rp) then
@@ -750,6 +770,51 @@ module mod_rk
       f = scalf - mean
     end if
   end subroutine rk_scal_cht
+  !
+  subroutine rk_scal_cht_conv(n,dli,dzfi,grid_vol_ratio_f,factor1,factor2,cs_cf_in,is_forced,scalf,u,v,w,phi, &
+                              dsdtrk,dsdtrko,s,f,mask)
+    !
+    ! Runge-Kutta substep of the convection of a CHT scalar whose conduction and sources are advanced by RKL2
+    ! (`is_cht_rkl2`, see `mod_cht_rkl2`); with `mask` (`is_cht_convmask`) no flux crosses a face between materials
+    !
+    use mod_scal, only: scal_cht_conv
+    implicit none
+    integer , intent(in), dimension(3) :: n
+    real(rp), intent(in), dimension(3) :: dli
+    real(rp), intent(in), dimension(0:) :: dzfi
+    real(rp), intent(in), dimension(:) :: grid_vol_ratio_f
+    real(rp), intent(in) :: factor1,factor2,cs_cf_in
+    logical , intent(in) :: is_forced
+    real(rp), intent(in) :: scalf
+    real(rp), intent(in), dimension(0:,0:,0:) :: u,v,w,phi
+    real(rp), intent(inout), dimension(:,:,:) :: dsdtrk,dsdtrko
+    real(rp), intent(inout), dimension(0:,0:,0:) :: s
+    real(rp), intent(out) :: f
+    logical , intent(in), dimension(0:,0:,0:), optional :: mask
+    real(rp) :: f1,f2,cs_cf,mean
+    integer :: i,j,k
+    f1 = factor1; f2 = factor2; cs_cf = cs_cf_in
+    if(present(mask)) then
+      call scal_cht_conv(n(1),n(2),n(3),dli(1),dli(2),dzfi,cs_cf,u,v,w,phi,s,dsdtrk,mask)
+    else
+      call scal_cht_conv(n(1),n(2),n(3),dli(1),dli(2),dzfi,cs_cf,u,v,w,phi,s,dsdtrk)
+    end if
+    !$acc parallel loop collapse(3) default(present) async(1)
+    !$OMP PARALLEL DO   COLLAPSE(3) DEFAULT(shared)
+    do k=1,n(3)
+      do j=1,n(2)
+        do i=1,n(1)
+          s(i,j,k) = s(i,j,k) + f1*dsdtrk(i,j,k) + f2*dsdtrko(i,j,k)
+          dsdtrko(i,j,k) = dsdtrk(i,j,k)
+        end do
+      end do
+    end do
+    f = 0._rp
+    if(is_forced) then
+      call bulk_mean(n,grid_vol_ratio_f,s(:,:,:),mean)
+      f = scalf - mean
+    end if
+  end subroutine rk_scal_cht_conv
   !
   subroutine cmpt_bulk_forcing(n,is_forced,velf,grid_vol_ratio_c,grid_vol_ratio_f,u,v,w,f)
     implicit none

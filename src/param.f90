@@ -105,6 +105,20 @@ real(rp), protected, allocatable, dimension(:) :: cs_cf  ! size (nscal)
 real(rp), protected, allocatable, dimension(:) :: qw_ibm ! size (nscal)
 real(rp), protected :: qw_ibm_eps = 1.5_rp
 !
+! CHT scalars, per scalar (default F, see `mod_cht_tang`, `mod_cht_rkl2`):
+!   is_cht_rkl2       the conjugate conduction (and the sources) advanced by RKL2 super time-stepping, Strang-split
+!                     around the Runge-Kutta step of the convection, instead of explicitly or by the factorized
+!                     implicit solve; the scalar diffusion then does not limit the time step
+!   is_cht_tang       the tangential face flux (k_area-k_face)*s_t at the faces the interface cuts or clips: second
+!                     order at a curved or oblique interface (needs is_cht_rkl2 and `geometry = 'sdf'`)
+!   is_cht_tang_guard a face whose tangential term would exceed cht_tang_cap times either cell's series diagonal
+!                     keeps the series flux (needed at large conductivity ratios, about k_s/k_f >= 100)
+!   is_cht_convmask   no convective flux through a face whose two cells are in different materials (with
+!                     is_cht_rkl2)
+!
+logical , protected, allocatable, dimension(:) :: is_cht_rkl2,is_cht_tang,is_cht_tang_guard,is_cht_convmask ! size (nscal)
+real(rp), protected :: cht_tang_cap = 3._rp
+!
 #if defined(_OPENACC)
 !
 ! cuDecomp input parameters
@@ -218,6 +232,7 @@ contains
                      const_scal,scal_mean_grad,&
                      is_cht,ks_kf,cs_cf,&
                      qw_ibm,qw_ibm_eps,&
+                     is_cht_rkl2,is_cht_tang,is_cht_tang_guard,cht_tang_cap,is_cht_convmask,&
                      ssource,ssource_s, &
                      is_sforced, &
                      scalf, &
@@ -386,6 +401,7 @@ contains
                  cbcscal(0:1,3,nscal),bcscal(0:1,3,nscal), &
                  cbcscal_ibm(nscal),bcscal_ibm(nscal),bcscal_ibm_top(nscal),&
                  is_cht(nscal),ks_kf(nscal),cs_cf(nscal),qw_ibm(nscal),&
+                 is_cht_rkl2(nscal),is_cht_tang(nscal),is_cht_tang_guard(nscal),is_cht_convmask(nscal),&
                  ssource(nscal),ssource_s(nscal),is_sforced(nscal),scalf(nscal),scal_mean_grad(nscal))
         !
         ! set default values
@@ -404,6 +420,10 @@ contains
         ks_kf(:)       = 1._rp
         cs_cf(:)       = 1._rp
         qw_ibm(:)      = 0._rp
+        is_cht_rkl2(:)       = .false.
+        is_cht_tang(:)       = .false.
+        is_cht_tang_guard(:) = .false.
+        is_cht_convmask(:)   = .false.
         !
         ! read `scalar` namelist
         !
@@ -417,6 +437,19 @@ contains
           error stop
         end if
         where(bcscal_ibm_top(:) == huge(1._rp)) bcscal_ibm_top(:) = bcscal_ibm(:)
+        if(any((is_cht_rkl2(:) .or. is_cht_tang(:) .or. is_cht_tang_guard(:) .or. is_cht_convmask(:)) .and. .not.is_cht(:))) then
+          if(myid == 0) print*, 'ERROR: `is_cht_rkl2`, `is_cht_tang`, `is_cht_tang_guard` and `is_cht_convmask` need `is_cht = T`.'
+          call MPI_FINALIZE(ierr)
+          close(iunit)
+          error stop
+        end if
+        if(any(is_cht_tang(:) .and. .not.is_cht_rkl2(:)) .or. any(is_cht_convmask(:) .and. .not.is_cht_rkl2(:)) .or. &
+           any(is_cht_tang_guard(:) .and. .not.is_cht_tang(:))) then
+          if(myid == 0) print*, 'ERROR: `is_cht_tang` and `is_cht_convmask` need `is_cht_rkl2 = T`, `is_cht_tang_guard` needs `is_cht_tang = T`.'
+          call MPI_FINALIZE(ierr)
+          close(iunit)
+          error stop
+        end if
       else
         nscal = 0 ! negative values equivalent to nscal = 0
       end if

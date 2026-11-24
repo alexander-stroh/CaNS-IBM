@@ -61,3 +61,34 @@ assembled operator. The two agree to round-off (1e-16), on both paths.
 `regress_examples.sh <cans> <refdir> <rundir> [case ...] [-- key=value ...]` runs `examples/cht-levelset/slab` and
 `wavy`. If `<refdir>/<case>.md5` is missing, it saves the checksums of the outputs there. Otherwise it checks them,
 bit for bit. Entries after `--` are set in `input.nml`.
+
+## The tangential face flux (`--scheme tang`)
+
+`--scheme tang` runs every case with `&scalar is_cht_rkl2 = T, is_cht_tang = T`. CaNS then also writes its tangential
+face list (`data/cht_tang_001.bin`: per face the lower cell, the axis and the 18 coefficients of `(k_area-k_face)*s_t`
+on the 2x3x3 block), which the script adds to the series operator exactly as `cht_tang_apply` does (`sdf` path only;
+the tangential term needs the level set). `fidelity --scheme tang` takes one RKL2 step of CaNS (two half steps, zero
+velocity) against the same step on the assembled operator.
+
+Results (2026-11-24, `sdf`, 150 cases, `run/cht_order_dev/tang_sdf.json`):
+
+* **Fidelity:** 4e-16 (RKL2 step of CaNS against the harness).
+* **Order:** L2 2.00-2.06 on the finest pair in all 30 groups; Linf 1.97-2.03, except three groups at κ = 10
+  (1.84-1.93: `flat-off` aspect 1 and 4, `curved2` aspect 4).
+* **Against the series flux** (`run/cht_order/phase0_step1.json`): at aspect 1 the L2 error is 1.4-12 times and the
+  Linf error 3-19 times smaller on the cut families; at aspect 4 the errors are similar on these grids (the series
+  flux's first-order defect is masked there, see the port log), but the series orders keep falling while the
+  tangential ones stay at 2. `flat-on` is the series operator itself (no face gets a term).
+* **Conservation:** column sums of the volume-weighted operator below 3.4e-16 relative; 0 link/material mismatches.
+
+Two further checks:
+
+* `plane_exactness.py --cans <cans>`: an interface inclined at 30 deg and the conjugate-linear field
+  `a + sigma.s + q n/k`. The face flux of the scheme is exact to round-off on the y and z faces (4e-15 to 3.5e-14
+  relative at κ = 2 and 12), and to the 20-column face quadrature on the x faces (1.2e-4, 1.2e-3); the series flux
+  alone misses the faces by 13-89 %.
+* `worked_example_check.py --cans <cans>`: the node of "The example in numbers" of the AMPHIBIOUS note
+  (`theory/test-code/worked-example/worked_example.json`). The series conductances agree to 1e-4 (S) and 1e-3 (W),
+  the coefficients `(k_area-k_face)*w` of the three faces with a term to 1.5-2.3 % on S and E; on W the weights agree to
+  0.5 % and `k_area-k_face`, small there, to 15 %. The differences come from the geometry: CaNS takes the interface
+  from the level set at the cell centres, AMPHIBIOUS bisects the exact wall.

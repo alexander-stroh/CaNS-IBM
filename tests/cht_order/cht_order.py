@@ -43,6 +43,12 @@ Usage (from anywhere; cans defaults to <repo>/build/cans, work dir to <repo>/run
 `run` writes <work>/results.json and prints L2/Linf errors and orders; `fidelity` checks that the
 operator assembled here IS the one the code applies: one explicit RK3 step of CaNS from a given
 field (zero velocity, sources in both materials, capacity ratio 2) against the same step taken here.
+
+--scheme tang (default step1): the scalar runs with `is_cht_rkl2 = T` and `is_cht_tang = T`; CaNS then also
+writes its tangential face list (data/cht_tang_001.bin: per face the lower cell, the axis and the 18
+coefficients of (k_area-k_face)*s_t on the 2x3x3 block), which is added here to the series operator exactly
+as `cht_tang_apply` adds it. With `fidelity` the CaNS step is RKL2 (two half steps around the convection,
+which vanishes at zero velocity), taken here with the same stage counts.
 """
 import argparse, json, math, os, re, shutil, subprocess, sys, time
 from concurrent.futures import ProcessPoolExecutor
@@ -59,6 +65,7 @@ ZREF = 0.4                      # centre of the manufactured F
 GRIDS = {1: [16, 24, 32, 48, 64], 4: [8, 12, 16, 24, 32]}
 QUICK = {1: [16, 24, 32], 4: [8, 12, 16]}
 FAMILIES = ['flat-on', 'flat-off', 'corr', 'curved', 'curved2']
+SCHEME = 'step1'                # or 'tang' (--scheme)
 TP = 2*math.pi
 
 
@@ -228,7 +235,7 @@ cbcscal_ibm(:) = 'D'
 bcscal_ibm(:)  = 0.
 const_scal = T
 is_boussinesq_buoyancy = F
-/
+{scheme}/
 
 &cudecomp
 cudecomp_t_comm_backend = 1, cudecomp_is_t_enable_nccl = T, cudecomp_is_t_enable_nvshmem = F
@@ -267,7 +274,9 @@ class Case:
         self.dx, self.dy, self.dz = 1/N, 1/N, LZ/self.nz
         assert abs(self.dz*aspect - self.dx) < 1e-14
         self.g = wall(family, self.dz)
-        self.dir = Path(work)/f'{path}-{family}-k{kappa:g}-a{aspect}-n{N}'
+        self.scheme = SCHEME
+        pre = '' if SCHEME == 'step1' else SCHEME + '-'
+        self.dir = Path(work)/f'{pre}{path}-{family}-k{kappa:g}-a{aspect}-n{N}'
         self.xc = (np.arange(self.nx) + 0.5)*self.dx
         self.yc = (np.arange(self.ny) + 0.5)*self.dy
         self.zc = (np.arange(self.nz) + 0.5)*self.dz        # checked against data/grid.out
@@ -290,7 +299,9 @@ class Case:
                                               restart=restart, kappa=float(self.kappa), cs=float(cs),
                                               ssource=float(ssource), ssource_s=float(ssource_s),
                                               bc0=float(bc[0]), bc1=float(bc[1]),
-                                              geometry=self.path, analytic=an))
+                                              geometry=self.path, analytic=an,
+                                              scheme='' if self.scheme == 'step1' else
+                                              'is_cht_rkl2(:) = T\nis_cht_tang(:) = T\n'))
         X, Y, Z = self.mesh()
         self.ps = sdf(ex, X, Y, Z)                       # also the material of the analytic path
         if self.path == 'sdf':
@@ -311,6 +322,43 @@ class Case:
         g = np.loadtxt(self.dir/'data'/'grid.out')
         assert np.allclose(g[1:self.nz + 1, 2], self.zc, rtol=0, atol=1e-14), 'unexpected z grid'
         return f
+
+
+    def tang_faces(self):
+        """the tangential face list CaNS wrote (scheme 'tang'): [(i, j, k, axis, c[18])], 1-based cells"""
+        p = self.dir/'data'/'cht_tang_001.bin'
+        if self.scheme == 'step1' or not p.exists():
+            return []
+        raw = p.read_bytes()
+        nf = int(np.frombuffer(raw[:4], '<i4')[0])
+        rec = np.dtype([('ijkd', '<i4', 4), ('c', '<f8', 18)])
+        a = np.frombuffer(raw[16:], rec, count=nf)
+        return [(*map(int, r['ijkd']), r['c'].copy()) for r in a]
+
+
+def block_offset(m, d):
+    """the m-th cell (m = 1..18) of the block of a face along axis d (1..3), as `block_offset` in cht_tang.f90"""
+    a = (m - 1)//9; r = (m - 1) % 9; b = r//3 - 1; cc = r % 3 - 1
+    return {1: (a, b, cc), 2: (b, a, cc), 3: (b, cc, a)}[d]
+
+
+def tang_matrix(c, faces):
+    """the tangential term as `cht_tang_apply` adds it (without the capacity): a face's
+    st = sum_m c_m T(block_m) enters its lower cell with +st/W and its upper cell with -st/W, each only
+    where that cell is local (a periodic face appears once for each of its two cells)"""
+    nx, ny, nz = c.nx, c.ny, c.nz
+    idx = np.arange(nx*ny*nz).reshape(nx, ny, nz)
+    W = {1: c.dx, 2: c.dy, 3: c.dz}
+    rows, cols, vals = [], [], []
+    for (i, j, k, d, cf) in faces:
+        cl = [idx[(i + o[0] - 1) % nx, (j + o[1] - 1) % ny, k + o[2] - 1] for o in (block_offset(m, d) for m in range(1, 19))]
+        for side, sgn in ((0, 1.), (1, -1.)):
+            ci, cj, ck = i + (side if d == 1 else 0), j + (side if d == 2 else 0), k + (side if d == 3 else 0)
+            if not (1 <= ci <= nx and 1 <= cj <= ny and 1 <= ck <= nz):
+                continue
+            r = idx[ci - 1, cj - 1, ck - 1]
+            rows.extend([r]*18); cols.extend(cl); vals.extend(sgn*cf/W[d])
+    return sps.csr_matrix((vals, (rows, cols)), shape=(idx.size, idx.size))
 
 
 # ----------------------------------------------------------------------------- the operator
@@ -346,6 +394,9 @@ def assemble(c, th, kappa):
     dg[idx[:, :, 0].ravel()] -= wb
     dg[idx[:, :, -1].ravel()] -= wt
     L = (L + sps.diags(dg)).tocsr()
+    faces = c.tang_faces()
+    if faces:
+        L = (L + tang_matrix(c, faces)).tocsr()
     return L, wb, wt
 
 
@@ -395,14 +446,17 @@ def solve_case(c, ex):
     cut = (th[3] > 1e-9) & (th[3] < 1 - 1e-9)        # cut cells (phi of a face-aligned wall is 1 - O(1e-16))
     # conservation: the volume-weighted operator has zero column sums (except at the box faces)
     cs = np.abs(np.asarray(L.sum(axis=0)).ravel()).reshape(Te.shape)[:, :, 1:-1].max()/np.abs(L.diagonal()).max()
-    return dict(path=c.path, family=c.family, kappa=c.kappa, aspect=c.aspect, N=c.N, nz=c.nz,
+    return dict(path=c.path, family=c.family, kappa=c.kappa, aspect=c.aspect, N=c.N, nz=c.nz, scheme=c.scheme,
+                tang_faces=len(c.tang_faces()),
                 h=max(c.dx, c.dz), L2=float(np.sqrt(np.mean(e**2))), Linf=float(np.abs(e).max()),
                 Linf_fluid=float(np.abs(e[fl]).max()), Linf_solid=float(np.abs(e[~fl]).max()),
                 cut_cells=int(cut.sum()), link_mismatch=nbad, colsum=float(cs))
 
 
 def one(args):
-    path, family, kappa, aspect, N, work, cans = args
+    path, family, kappa, aspect, N, work, cans, scheme = args
+    global SCHEME
+    SCHEME = scheme
     c = Case(path, family, kappa, aspect, N, work)
     ex = Exact(c.g, kappa)
     t0 = time.time()
@@ -472,12 +526,33 @@ def fidelity(cans, work, path='sdf', family='curved', kappa=2.0, N=12, aspect=1)
         g[idx[:, :, 0].ravel()] = wb*(2*bc[0] - T[idx[:, :, 0].ravel()])
         g[idx[:, :, -1].ravel()] = wt*(2*bc[1] - T[idx[:, :, -1].ravel()])
         return capi*(L @ T + g)
-    rk = [(32/60, 0.), (25/60, -17/60), (45/60, -25/60)]
-    T = T0.ravel().copy(); old = np.zeros(T0.size)
-    for a, bb in rk:
-        new = slope(T)
-        T = T + a*dt*new + bb*dt*old + (a + bb)*dt*src
-        old = new
+    T = T0.ravel().copy()
+    if c.scheme == 'step1':
+        rk = [(32/60, 0.), (25/60, -17/60), (45/60, -25/60)]
+        old = np.zeros(T0.size)
+        for a, bb in rk:
+            new = slope(T)
+            T = T + a*dt*new + bb*dt*old + (a + bb)*dt*src
+            old = new
+    else:
+        # RKL2, two half steps (the convection between them vanishes at zero velocity); the stage count
+        # from the Gershgorin bound the code printed
+        G = float(re.search(r'Gershgorin bound of the conduction operator\s+(\S+)', (c.dir/'run.log').read_text()).group(1))
+        s = 2
+        while 0.5*(s*s + s - 2) < 0.5*dt*G:
+            s += 1
+        M = lambda Y: slope(Y) + src
+        b = lambda j: 1/3 if j < 2 else (j*j + j - 2)/(2*j*(j + 1))
+        w1 = 4/(s*s + s - 2); h = 0.5*dt
+        for half in range(2):
+            Y0 = T.copy(); M0 = M(Y0)
+            Ym2, Ym1 = Y0, Y0 + w1/3*h*M0
+            for j in range(2, s + 1):
+                mu = (2*j - 1)/j*b(j)/b(j - 1); nu = -(j - 1)/j*b(j)/b(j - 2)
+                mut = mu*w1; gat = -(1 - b(j - 1))*mut
+                Yj = mu*Ym1 + nu*Ym2 + (1 - mu - nu)*Y0 + mut*h*M(Ym1) + gat*h*M0
+                Ym2, Ym1 = Ym1, Yj
+            T = Ym1
     T1h = T.reshape(T0.shape)
     d = np.abs(T1h - T1c).max()
     step = np.abs(T1h - T0).max()
@@ -499,7 +574,10 @@ def main():
     ap.add_argument('--jobs', type=int, default=8)
     ap.add_argument('--quick', action='store_true', help='three coarse grids per case')
     ap.add_argument('--out', default='results.json')
+    ap.add_argument('--scheme', default='step1', choices=['step1', 'tang'])
     a = ap.parse_args()
+    global SCHEME
+    SCHEME = a.scheme
     work = Path(a.work); work.mkdir(parents=True, exist_ok=True)
     if a.mode == 'fidelity':
         res = [fidelity(a.cans, work, path=p) for p in a.paths.split(',')]
@@ -521,7 +599,7 @@ def main():
             for k in [float(v) for v in a.kappas.split(',')]:
                 for asp in [int(v) for v in a.aspects.split(',')]:
                     for N in grids[asp]:
-                        jobs.append((p, fam, k, asp, N, work, a.cans))
+                        jobs.append((p, fam, k, asp, N, work, a.cans, a.scheme))
     t0 = time.time()
     res = []
     with ProcessPoolExecutor(a.jobs) as pool:
