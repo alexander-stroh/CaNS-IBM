@@ -87,8 +87,8 @@ Two further checks:
   `a + sigma.s + q n/k`. The face flux of the scheme is exact to round-off on the y and z faces (4e-15 to 3.5e-14
   relative at κ = 2 and 12), and to the 20-column face quadrature on the x faces (1.2e-4, 1.2e-3); the series flux
   alone misses the faces by 13-89 %.
-* `worked_example_check.py --cans <cans>`: the node of "The example in numbers" of the AMPHIBIOUS note
-  (`theory/test-code/worked-example/worked_example.json`). The series conductances agree to 1e-4 (S) and 1e-3 (W),
+* `worked_example_check.py --cans <cans> --ref <worked_example.json>`: the node of "The example in numbers" of the
+  AMPHIBIOUS note (reference values in `worked_example.json` of the AMPHIBIOUS project, not in this repository). The series conductances agree to 1e-4 (S) and 1e-3 (W),
   the coefficients `(k_area-k_face)*w` of the three faces with a term to 1.5-2.3 % on S and E; on W the weights agree to
   0.5 % and `k_area-k_face`, small there, to 15 %. The differences come from the geometry: CaNS takes the interface
   from the level set at the cell centres, AMPHIBIOUS bisects the exact wall.

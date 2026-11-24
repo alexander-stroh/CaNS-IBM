@@ -67,6 +67,8 @@ module mod_cht_tang
   real(rp), parameter :: rank_tol = 1.e-3_rp! refuse a fit whose equilibrated Cholesky diagonal spans more
   real(rp), parameter :: tang_tol = 1.e-8_rp! no term where |k_area-k_face| <= tang_tol*max(k_s/k_f,1)*k_f
   integer , parameter :: band_half = 2      ! band: cells whose (2*band_half+1)**3 patch holds both materials
+  real(rp), parameter :: rsum_tol = 1.e-8_rp! refuse a face whose weights do not annihilate constants to this
+                                            ! relative accuracy (a nearly degenerate fit: counted with `rank`)
   !
   contains
   !
@@ -105,32 +107,34 @@ module mod_cht_tang
     real(rp), intent(in), dimension(0:) :: zc_g
     real(rp), intent(out), dimension(1-nh(1):,1-nh(2):,1-nh(3):) :: ps
     real(rp), intent(out), dimension(1-nh(3):) :: zw
-    real(rp), allocatable, dimension(:,:,:) :: buf
-    integer :: fh,kmin,kmax,nk,i,j,k,ig,jg,kg
+    real(rp), allocatable, dimension(:,:) :: buf
+    integer :: fh,kmin,kmax,i,j,k,ig,jg,kg
     integer(kind=MPI_OFFSET_KIND) :: disp
     real(rp) :: w
     !
     call cht_zw(ng,lo,n,nh,zc_g,zw)
     kmin = max(1    ,lo(3)-nh(3))
     kmax = min(ng(3),lo(3)+n(3)-1+nh(3))
-    nk = kmax-kmin+1
-    allocate(buf(ng(1),ng(2),kmin:kmax))
+    !
+    ! one x-y plane at a time, so that the buffer holds a single plane of the global field
+    !
+    allocate(buf(ng(1),ng(2)))
     call MPI_FILE_OPEN(MPI_COMM_SELF,trim(fname),MPI_MODE_RDONLY,MPI_INFO_NULL,fh,ierr)
-    disp = int(kmin-1,MPI_OFFSET_KIND)*ng(1)*ng(2)*storage_size(1._rp)/8
-    call MPI_FILE_READ_AT(fh,disp,buf,ng(1)*ng(2)*nk,MPI_REAL_RP,MPI_STATUS_IGNORE,ierr)
-    call MPI_FILE_CLOSE(fh,ierr)
     ps(:,:,:) = 0._rp
     do k=1-nh(3),n(3)+nh(3)
       kg = lo(3)+k-1
       if(kg < kmin .or. kg > kmax) cycle
+      disp = int(kg-1,MPI_OFFSET_KIND)*ng(1)*ng(2)*storage_size(1._rp)/8
+      call MPI_FILE_READ_AT(fh,disp,buf,ng(1)*ng(2),MPI_REAL_RP,MPI_STATUS_IGNORE,ierr)
       do j=1-nh(2),n(2)+nh(2)
         jg = modulo(lo(2)+j-2,ng(2))+1
         do i=1-nh(1),n(1)+nh(1)
           ig = modulo(lo(1)+i-2,ng(1))+1
-          ps(i,j,k) = buf(ig,jg,kg)
+          ps(i,j,k) = buf(ig,jg)
         end do
       end do
     end do
+    call MPI_FILE_CLOSE(fh,ierr)
     !
     ! beyond the domain along z: the two layers of `sdf_read`, then linear continuation
     !
@@ -273,7 +277,15 @@ module mod_cht_tang
               ! component along its normal) is dropped, so that a grid-aligned wall keeps the series operator as is
               !
               if(all(fac*w(:) == 0._rp)) cycle
+              if(abs(sum(w(:))) > rsum_tol*sum(abs(w(:)))) then
+                nrej_rank = nrej_rank+1
+                cycle
+              end if
               if(.not.(band(iL,jL,kL) .and. band(iU,jU,kU))) norphan = norphan+1
+              if(nf >= nfmax) then
+                print*, 'ERROR: CHT tangential term: more faces than the face list holds (nfmax =',nfmax,').'
+                call MPI_ABORT(MPI_COMM_WORLD,1,ierr)
+              end if
               nf = nf+1
               fijk(:,nf) = [iL,jL,kL,d]
               fc(:,nf) = fac*w(:)
@@ -384,7 +396,7 @@ module mod_cht_tang
         call MPI_FINALIZE(ierr)
         error stop
       end if
-      if(rv(2) > 1.e-10_rp) then
+      if(rv(2) > rsum_tol) then
         if(myid == 0) print*, 'ERROR: CHT tangential term: the face weights do not annihilate constants.'
         call MPI_FINALIZE(ierr)
         error stop

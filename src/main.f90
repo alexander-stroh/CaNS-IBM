@@ -370,6 +370,11 @@ program cans
     call MPI_FINALIZE(ierr)
     error stop
   end if
+  if(is_tang_any .and. any(cbcpre(0:1,1:2) /= 'P')) then
+    if(myid == 0) print*, 'ERROR: `is_cht_tang` needs periodic boundaries along x and y (the fit wraps the level set there).'
+    call MPI_FINALIZE(ierr)
+    error stop
+  end if
   !
   if(use_hmap)then
     call read_thakkar_nfo(myid)

@@ -2,7 +2,7 @@
 """
 Gate 1e of the port: the tangential face flux of CaNS (`is_cht_tang`) against AMPHIBIOUS on the node of
 "The example in numbers" (cht_method_results.tex; reference values in
-$CHT/theory/test-code/worked-example/worked_example.json).
+`worked_example.json` of the AMPHIBIOUS project, passed with --ref).
 
 AMPHIBIOUS: node (j,k) = (5,7) at (y,z) = (0.2, 0.3), wall y_w(z) = 0.225 + 0.1 cos(2 pi z) (solid below),
 h = 0.05, kappa = C_s = 2, x-invariant. Its nodes sit at (j-1)h, (k-1)h; CaNS's cell centres at (k-1/2)h. In
@@ -16,7 +16,7 @@ on each x-plane, a third of the weight each). The geometry differs by design: AM
 wall, CaNS works from the level set at the cell centres (quadratic link fractions, Taylor-model face
 fractions), so agreement to the accuracy of that path is expected, not to round-off.
 
-    python3 worked_example_check.py --cans <cans> [--work DIR]
+    python3 worked_example_check.py --cans <cans> --ref <worked_example.json> [--work DIR]
 """
 import argparse, json, math, subprocess, sys
 from pathlib import Path
@@ -25,7 +25,6 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import cht_order as co
 
-REF = Path('/net/istm-io1/localvol/rc8764/riblets/cht/theory/test-code/worked-example/worked_example.json')
 H = 0.05
 
 
@@ -44,6 +43,7 @@ class Wall:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--cans', required=True)
+    ap.add_argument('--ref', required=True, help='worked_example.json, the AMPHIBIOUS reference values')
     ap.add_argument('--work', default=str(HERE.parent.parent/'run'/'worked_example'))
     a = ap.parse_args()
     d = Path(a.work); (d/'data').mkdir(parents=True, exist_ok=True)
@@ -69,7 +69,7 @@ def main():
     rec = np.dtype([('ijkd', '<i4', 4), ('c', '<f8', 18)])
     faces = {tuple(int(v) for v in f['ijkd']): f['c'] for f in np.frombuffer(raw[16:], rec, count=nf)}
     kface = lambda t: 1./(t + (1 - t)/2.0)
-    ref = json.load(open(REF))
+    ref = json.load(open(a.ref))
     out = []
     # (name, AMPHIBIOUS face id, CaNS lower cell (j,k) and axis)
     for name, fid, (j, k, ax) in (('S', '1', (7, 4, 3)), ('W', '3', (6, 5, 2)), ('E', '4', (7, 5, 2))):

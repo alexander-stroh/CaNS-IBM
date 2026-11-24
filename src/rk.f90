@@ -777,7 +777,7 @@ module mod_rk
     ! Runge-Kutta substep of the convection of a CHT scalar whose conduction and sources are advanced by RKL2
     ! (`is_cht_rkl2`, see `mod_cht_rkl2`); with `mask` (`is_cht_convmask`) no flux crosses a face between materials
     !
-    use mod_scal, only: scal_cht_conv
+    use mod_scal, only: scal_cht_conv,scal_cht_conv_mask
     implicit none
     integer , intent(in), dimension(3) :: n
     real(rp), intent(in), dimension(3) :: dli
@@ -795,7 +795,7 @@ module mod_rk
     integer :: i,j,k
     f1 = factor1; f2 = factor2; cs_cf = cs_cf_in
     if(present(mask)) then
-      call scal_cht_conv(n(1),n(2),n(3),dli(1),dli(2),dzfi,cs_cf,u,v,w,phi,s,dsdtrk,mask)
+      call scal_cht_conv_mask(n(1),n(2),n(3),dli(1),dli(2),dzfi,cs_cf,u,v,w,phi,s,mask,dsdtrk)
     else
       call scal_cht_conv(n(1),n(2),n(3),dli(1),dli(2),dzfi,cs_cf,u,v,w,phi,s,dsdtrk)
     end if
