@@ -1677,9 +1677,9 @@ module mod_ibm
                 f = [i,j,k]+e(:); e(:) = -e(:) ! fluid node: the neighbour, solid node f+e = this one
             end if
             b(:) = f(:)-e(:)          ! node beyond the fluid node
-            ok = sdf_stag(ps,n,dzc,dzf,c,f(1),f(2),f(3),pf)
-            ok = sdf_stag(ps,n,dzc,dzf,c,f(1)+e(1),f(2)+e(2),f(3)+e(3),pn)
-            if(.not.sdf_stag(ps,n,dzc,dzf,c,b(1),b(2),b(3),pm)) pm = -1._rp ! -> linear
+            ok = sdf_stag(ps,n,c,f(1),f(2),f(3),pf)
+            ok = sdf_stag(ps,n,c,f(1)+e(1),f(2)+e(2),f(3)+e(3),pn)
+            if(.not.sdf_stag(ps,n,c,b(1),b(2),b(3),pm)) pm = -1._rp ! -> linear
             !
             ! node spacings from f towards the solid node (hn) and towards b (hm), as in `set_ibm_2nd_sdf`
             !

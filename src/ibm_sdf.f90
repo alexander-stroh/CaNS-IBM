@@ -31,9 +31,13 @@ module mod_ibm_sdf
   use mod_common_mpi, only: myid,ierr
   implicit none
   private
-  public sdf_read,sdf_staggered,sdf_mask,set_ibm_2nd_sdf,calc_grad_dist_sdf,set_cht_geometry_sdf
+  public sdf_read,sdf_zgrid,sdf_staggered,sdf_mask,set_ibm_2nd_sdf,calc_grad_dist_sdf,set_cht_geometry_sdf
   public frac_q,sdf_stag,sdf_point,sdf_taylor,sdf_taylor_eval,fluid_length
   public sdf_interface_density
+  !
+  ! weight of ps(k+1) at the w node k (between the cell centres k and k+1), k = -1 ... n(3)+1 (`sdf_zgrid`)
+  !
+  real(rp), allocatable, dimension(:) :: wz_sdf
   contains
   subroutine sdf_read(fname,ng,lo,n,zc,ps)
     !
@@ -96,21 +100,51 @@ module mod_ibm_sdf
     end if
   end subroutine sdf_read
   !
-  subroutine sdf_staggered(n,dzc,dzf,ps,phi_s,phi_u,phi_v,phi_w)
+  subroutine sdf_zgrid(ng,lo,n,zc_g,dzc_g,dzf_g,ze)
     !
-    ! level set at the cell centres (phi_s) and at the u, v, w positions (linear interpolation),
-    ! on the arrays with one halo layer (0:n+1)
+    ! the z grid of the level set's points (two halo layers), from the global grid, so that tasks sharing
+    ! a face along z use the same numbers there:
+    !   ze(-1:n(3)+2): cell-centre z coordinates; beyond the domain, linear extrapolation of the ghost
+    !                  cell, as for the level set in `sdf_read`
+    !   wz_sdf(-1:n(3)+1): weight of ps(k+1) at the w node k, dzf/(2 dzc); beyond the domain, 1/2
+    !
+    implicit none
+    integer , intent(in), dimension(3) :: ng,lo,n
+    real(rp), intent(in), dimension(0:) :: zc_g,dzc_g,dzf_g
+    real(rp), intent(out), dimension(-1:) :: ze
+    integer :: k,kg
+    do k=-1,n(3)+2
+      kg = lo(3)+k-1
+      if(kg < 0) then
+        ze(k) = 2._rp*zc_g(0)-zc_g(1)
+      else if(kg > ng(3)+1) then
+        ze(k) = 2._rp*zc_g(ng(3)+1)-zc_g(ng(3))
+      else
+        ze(k) = zc_g(kg)
+      end if
+    end do
+    if(allocated(wz_sdf)) deallocate(wz_sdf)
+    allocate(wz_sdf(-1:n(3)+1))
+    do k=-1,n(3)+1
+      kg = lo(3)+k-1
+      wz_sdf(k) = 0.5_rp
+      if(kg >= 0 .and. kg <= ng(3)) wz_sdf(k) = 0.5_rp*dzf_g(kg)/dzc_g(kg) ! zf(k) between zc(k) and zc(k+1)
+    end do
+  end subroutine sdf_zgrid
+  !
+  subroutine sdf_staggered(n,ps,phi_s,phi_u,phi_v,phi_w)
+    !
+    ! level set at the cell centres (phi_s) and at the u, v, w positions (linear interpolation, along z
+    ! with the weights `wz_sdf` of `sdf_zgrid`), on the arrays with one halo layer (0:n+1)
     !
     implicit none
     integer , intent(in), dimension(3) :: n
-    real(rp), intent(in), dimension(0:) :: dzc,dzf
     real(rp), intent(in), dimension(-1:,-1:,-1:) :: ps
     real(rp), intent(out), dimension(0:,0:,0:) :: phi_s,phi_u,phi_v,phi_w
     integer :: i,j,k
     real(rp) :: wz
     do k=0,n(3)+1
-      wz = 0.5_rp
-      if(k <= n(3)) wz = 0.5_rp*dzf(k)/dzc(k) ! zf(k) between zc(k) and zc(k+1)
+      wz = wz_sdf(k)
       do j=0,n(2)+1
         do i=0,n(1)+1
           phi_s(i,j,k) = ps(i,j,k)
@@ -297,7 +331,7 @@ module mod_ibm_sdf
     end do
   end subroutine calc_grad_dist_sdf
   !
-  subroutine set_cht_geometry_sdf(n,dl,zc,dzc,dzf,ps,is_2nd,thx,thy,thz,phi)
+  subroutine set_cht_geometry_sdf(n,dl,ze,dzc,dzf,ps,is_2nd,thx,thy,thz,phi)
     !
     ! as `set_cht_geometry` (see `mod_ibm`), from the level set at the cell centres (ps, two halo layers):
     !   thx(i,j,k): fluid fraction of the segment between the centres of cells i and i+1 (thy, thz alike):
@@ -305,26 +339,20 @@ module mod_ibm_sdf
     !               the cell face (staircase)
     !   phi(i,j,k): fluid volume fraction: cut of the cell with the zero level of the quadratic Taylor
     !               expansion of the level set about the cell centre (`is_2nd`), or 0/1 (staircase)
+    !   ze(-1:n(3)+2): cell-centre z coordinates of ps (`sdf_zgrid`)
     !
     implicit none
     integer , intent(in), dimension(3) :: n
     real(rp), intent(in), dimension(3) :: dl
-    real(rp), intent(in), dimension(0:) :: zc,dzc,dzf
+    real(rp), intent(in), dimension(-1:) :: ze
+    real(rp), intent(in), dimension(0:) :: dzc,dzf
     real(rp), intent(in), dimension(-1:,-1:,-1:) :: ps
     logical , intent(in) :: is_2nd
     real(rp), intent(out), dimension(0:,0:,0:) :: thx,thy,thz,phi
     integer, parameter :: ns = 20 ! sub-columns per direction for the volume fraction
-    real(rp), allocatable, dimension(:) :: ze
     integer  :: i,j,k,a,b,ncut
     real(rp) :: pc,pn,dz,hz,rdiag,fsum,xo,yo,g(3),hs(3,3),qa,qb,qc
     real(rp) :: zm,zp,dm,dp
-    !
-    ! cell-centre z coordinates with two halo layers (linear extrapolation of the spacing)
-    !
-    allocate(ze(-1:n(3)+2))
-    ze(0:n(3)+1) = zc(0:n(3)+1)
-    ze(-1) = 2._rp*ze(0)-ze(1)
-    ze(n(3)+2) = 2._rp*ze(n(3)+1)-ze(n(3))
     ncut = 0
     do k=0,n(3)+1
       do j=0,n(2)+1
@@ -458,7 +486,7 @@ module mod_ibm_sdf
     call MPI_ALLREDUCE(MPI_IN_PLACE,area,1,MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
   end subroutine sdf_interface_density
   !
-  function sdf_stag(ps,n,dzc,dzf,c,i,j,k,val) result(ok)
+  function sdf_stag(ps,n,c,i,j,k,val) result(ok)
     !
     ! level set at the node (i,j,k) of the grid of variable c (0: cell centres, 1, 2, 3: u, v, w), as in
     ! `sdf_staggered`, from the cell-centred level set with two halo layers; .false. if the node is out of
@@ -467,7 +495,6 @@ module mod_ibm_sdf
     implicit none
     real(rp), intent(in), dimension(-1:,-1:,-1:) :: ps
     integer , intent(in), dimension(3) :: n
-    real(rp), intent(in), dimension(0:) :: dzc,dzf
     integer , intent(in) :: c,i,j,k
     real(rp), intent(out) :: val
     logical :: ok
@@ -486,8 +513,7 @@ module mod_ibm_sdf
     case(2)
       val = 0.5_rp*(ps(i,j,k)+ps(i,j+1,k))
     case default
-      wz = 0.5_rp
-      if(k >= 0 .and. k <= n(3)) wz = 0.5_rp*dzf(k)/dzc(k)
+      wz = wz_sdf(k)
       val = (1._rp-wz)*ps(i,j,k) + wz*ps(i,j,k+1)
     end select
   end function sdf_stag

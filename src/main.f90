@@ -98,7 +98,7 @@ program cans
   use mod_cht_tang       , only: cht_tang_t,cht_tang_setup,cht_tang_dump,cht_rkl2_stages,cht_sdf_read_halo,cht_halo_width, &
                                  cht_zw
   use mod_cht_rkl2       , only: cht_rkl2_step
-  use mod_ibm_sdf        , only: sdf_read,sdf_staggered,sdf_mask,set_ibm_2nd_sdf,calc_grad_dist_sdf, &
+  use mod_ibm_sdf        , only: sdf_read,sdf_zgrid,sdf_staggered,sdf_mask,set_ibm_2nd_sdf,calc_grad_dist_sdf, &
                                  set_cht_geometry_sdf,sdf_interface_density
   use mod_ibm_damp       , only: ibm_damp_init
   use mod_param          , only: is_ibm_damp,ibm_damp_d
@@ -668,7 +668,9 @@ program cans
     allocate(phi_s_sdf(0:n(1)+1,0:n(2)+1,0:n(3)+1),phi_u_sdf(0:n(1)+1,0:n(2)+1,0:n(3)+1), &
              phi_v_sdf(0:n(1)+1,0:n(2)+1,0:n(3)+1),phi_w_sdf(0:n(1)+1,0:n(2)+1,0:n(3)+1))
     call sdf_read(sdf_file,ng,lo,n,zc,ps_sdf)
-    call sdf_staggered(n,dzc,dzf,ps_sdf,phi_s_sdf,phi_u_sdf,phi_v_sdf,phi_w_sdf)
+    allocate(ze_sdf(-1:n(3)+2))
+    call sdf_zgrid(ng,lo,n,zc_g,dzc_g,dzf_g,ze_sdf)
+    call sdf_staggered(n,ps_sdf,phi_s_sdf,phi_u_sdf,phi_v_sdf,phi_w_sdf)
     call sdf_mask(phi_u_sdf,mask_u)
     call sdf_mask(phi_v_sdf,mask_v)
     call sdf_mask(phi_w_sdf,mask_w)
@@ -779,10 +781,6 @@ program cans
                                         n_wave,l_0,phase_l,n,l,hmap_tha,lx_tha,ly_tha,&
                                         nx_hmap_tha,ny_hmap_tha,frifv)
     else
-      allocate(ze_sdf(-1:n(3)+2))
-      ze_sdf(0:n(3)+1) = zc(0:n(3)+1)
-      ze_sdf(-1) = 2._rp*ze_sdf(0)-ze_sdf(1)
-      ze_sdf(n(3)+2) = 2._rp*ze_sdf(n(3)+1)-ze_sdf(n(3))
       call init_wall_force(n,lo,l,dl,zc,zf,dzc,dzf,mask_u,mask_v,mask_w,mask_s,ibm_direction,amp_l,n_wave,l_0,phase_l, &
                            ps=ps_sdf,ze=ze_sdf)
       call init_fric_cubes(wf_cell,mask_s,lo,dl,zc,zf,dzc,&
@@ -835,7 +833,7 @@ program cans
              thz(0:n(1)+1,0:n(2)+1,0:n(3)+1), &
              phi_cht(0:n(1)+1,0:n(2)+1,0:n(3)+1))
     if(is_sdf)then
-      call set_cht_geometry_sdf(n,dl,zc,dzc,dzf,ps_sdf,.true.,thx,thy,thz,phi_cht)
+      call set_cht_geometry_sdf(n,dl,ze_sdf,dzc,dzf,ps_sdf,.true.,thx,thy,thz,phi_cht)
     else
       call set_cht_geometry(lo,n,l,dl,zc,dzc,dzf,mask_s,.true.,ibm_direction,amp_l,n_wave,l_0,phase_l,&
                             hmap_tha,lx_tha,ly_tha,nx_hmap_tha,ny_hmap_tha,thx,thy,thz,phi_cht)
